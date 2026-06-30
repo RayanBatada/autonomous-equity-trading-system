@@ -1,0 +1,103 @@
+ingest:
+  default_lookback_days: 1095        # 3 years on first run; runner uses 1 day on subsequent runs
+  rate_limits:
+    finnhub: { requests_per_minute: 55 }
+    newsapi: { requests_per_day: 90 }
+    edgar:   { requests_per_second: 9 }
+  retries:
+    max: 3
+    base_delay: 1.0
+    jitter: 0.5
+  circuit_breaker:
+    failures_to_open: 5
+    cooldown_minutes: 60
+
+sources_enabled:
+  - yfinance
+  - alpaca
+  - finnhub_news
+  - alpaca_news
+  # finnhub_sentiment requires a paid Finnhub plan (returns 403 on free tier).
+  # Re-enable if you upgrade.
+  - finnhub_fundamentals
+  - newsapi
+  - edgar
+
+agents:
+  # 2026-05-18: lifted 0.50 → 1.00. Triggered daily runs typically cost
+  # <$0.10; the extra headroom is for occasional manual force-full
+  # backfills (the 5/18 backfill cost $0.21 for 20 tickers before stalling)
+  # and for the natural Friday full-universe run (146 tickers ≈ $1.75
+  # which previously hit the $0.50 ceiling before completing).
+  daily_budget_usd: 1.00
+  warn_threshold_pct: 80
+  haiku_model_id: claude-haiku-4-5-20251001
+  triggers:
+    price_move_pct: 0.05
+    material_filing_types: ['8-K', '10-K', '10-Q']
+
+live:
+  alpaca_paper_endpoint: https://paper-api.alpaca.markets
+  use_theses: true                  # set per test-window gate result
+  rails:
+    # 2026-06-02: REVERTED to 0.0 (disabled). The 6/01 re-enable to 0.08 rested
+    # on a backtest with TWO bugs (fixed in 1297e68): (a) stop_loss_pct=0.0 fired
+    # on every flat/down position, so the "no-stop baseline" was a pathological
+    # 0%-stop; (b) the simulator never force-sold dropped names, making the stop
+    # the de-facto only exit. With both fixed, the stop is WORSE on every window:
+    #   VAL  (2025-07..12): no-stop sharpe +0.196 vs stop0.08 +0.116
+    #   TEST (2026-01..now): no-stop sharpe +1.137 (+13.6%) vs stop0.08 -2.965 (-14.1%)
+    # The 8% stop whipsaws out of positions that recover; force-sell already
+    # handles top-K exits. Lesson: never tune live on an unvalidated backtest.
+    stop_loss_pct: 0.0
+    cash_floor_pct: 0.05
+    # 2026-05-26: 0.25 → 0.35 to unblock cash deployment. Diagnosed
+    # against the live 5/25 top-10 predictions: 8 of 10 were
+    # Information Technology (MRVL, CRWD, PANW, ARM, ON, ORCL, AVGO,
+    # SNOW) but with the 25% cap and 10% target_weight per name, the
+    # bot could only hold 2 IT names → already maxed at MRVL+NOW →
+    # CRWD/PANW/ARM all blocked. Account sat at 75% cash ($75k of
+    # $100k) earning 0 while individual holdings ran +15%. 0.35 allows
+    # ~3 IT names + 2 from other sectors = ~50% deployment (double the
+    # current ~25%). Catastrophic-loss circuit breaker (>30% drop)
+    # still halts trading if a sector rotation goes hard against us.
+    max_sector_pct: 0.35
+    max_drawdown_pct: 0.15
+    max_position_pct: 0.10          # widened 2026-05-09 with v1 strategy (k=10 + weight_tilt). Concentrates same capital in fewer, higher-conviction names.
+    # 2026-06-12: 1 → 7. The corrected eval (rails finally matching the
+    # strategy's 10% targets) showed the old config churned the 30-day
+    # signal every ~4.6 days: val sharpe -1.58, -8.3%. min_hold=7 with the
+    # strategy block below holds winners ~12 days and flips val to +1.60,
+    # +14.9% (scripts/ab_wave3.py; plateau-checked in ab_wave4_robustness).
+    min_hold_days: 7
+    # 2026-06-16: drawdown-scaled de-risk — infrastructure shipped + tested,
+    # kept DISABLED (slope 0). The original "slope 1.5 helps" finding was an
+    # artifact of a simulator bug (buys gated before same-batch force-sell
+    # proceeds); after the parity fix, re-validation on the live-equivalent
+    # sim shows slope 1.5 HURTS (sharpe -0.11 vs +0.26 off) and only an
+    # aggressive slope 5.0 reduces drawdown (-9% vs -12.4%) — one window, not
+    # trustworthy. Drawdown-scaling on OWN equity isn't a clean win; revisit
+    # with a better regime signal + multi-window validation before enabling.
+    drawdown_derisk_start: 0.05
+    drawdown_derisk_slope: 0.0
+    drawdown_derisk_cap: 0.60
+  strategy:
+    # 2026-06-12 corrected-eval ship (val, window-start 2025-06-30 model):
+    #   baseline k=15:                    sharpe -1.58  ret -8.3%
+    #   + sector_neutralize=1.0:          sharpe +0.26  ret +3.9%
+    #   + hold_rank=30 + min_hold 7:      sharpe +1.60  ret +14.9%  hit 56%
+    # Neighbors (λ .75-1.0, hr 25-35, mh 5-7) all positive (+0.8..+1.7);
+    # mh>=10 degrades — do not raise min_hold past ~7 without re-measuring.
+    # NOTE: every PRE-6/10 backtest measured an inverse-selected tail book
+    # (eval-rails bug) — those numbers justified the old defaults.
+    k: 15
+    hold_rank: 30
+    sector_neutralize: 1.0
+  decide:
+    ingest_completion_max_retries: 20
+    ingest_completion_retry_seconds: 60
+  drift:
+    buy_miss_alert_threshold_pct: 0.20
+    partial_fill_alert_threshold_pct: 0.90
+    catastrophic_loss_alert_pct: 0.10
+    catastrophic_loss_abort_pct: 0.30

@@ -1,0 +1,324 @@
+universe:
+  refresh_policy: manual
+  tickers:
+    # ETFs / benchmarks
+    SPY: 2026-04-25
+    # Politician-trades thematic ETF (Subversive Unusual Whales Democratic
+    # Trading) — captures congressional trade alpha via a tradable wrapper
+    # while the raw-data ingest source (sma.ingest.sources.politician_trades)
+    # backfills. Added 2026-05-09 per user ask.
+    NANC: 2026-05-09
+    # SPDR sector ETFs (added 2026-05-26). Benchmarks for the
+    # rel_strength_sector_etf_30d feature — each ticker's 30d return is
+    # subtracted from its sector ETF's 30d return. Rarely make top-K
+    # (sector-average returns are below the best single names) so they
+    # almost never end up as intended_orders, but the model gets to use
+    # them as training samples + the feature builder needs their prices.
+    XLB: 2026-05-26     # Materials
+    XLC: 2026-05-26     # Communication Services
+    XLE: 2026-05-26     # Energy
+    XLF: 2026-05-26     # Financials
+    XLI: 2026-05-26     # Industrials
+    XLK: 2026-05-26     # Information Technology
+    XLP: 2026-05-26     # Consumer Staples
+    XLRE: 2026-05-26    # Real Estate
+    XLU: 2026-05-26     # Utilities
+    XLV: 2026-05-26     # Health Care
+    XLY: 2026-05-26     # Consumer Discretionary
+    # Tech mega-cap
+    AAPL: 2026-04-25
+    MSFT: 2026-04-25
+    GOOGL: 2026-04-25
+    AMZN: 2026-04-25
+    META: 2026-04-25
+    NVDA: 2026-04-25
+    TSLA: 2026-04-25
+    AVGO: 2026-04-25
+    ORCL: 2026-04-25
+    CRM: 2026-04-25
+    ADBE: 2026-04-25
+    CSCO: 2026-04-25
+    ACN: 2026-04-25
+    INTC: 2026-04-25
+    AMD: 2026-04-25
+    QCOM: 2026-04-25
+    TXN: 2026-04-25
+    IBM: 2026-04-25
+    INTU: 2026-04-25
+    NOW: 2026-04-25
+    # Tech expansion 2026-05-10
+    PYPL: 2026-05-10    # PayPal
+    AMAT: 2026-05-10    # Applied Materials (semis)
+    LRCX: 2026-05-10    # Lam Research (semis)
+    TSM: 2026-05-10     # Taiwan Semiconductor (ADR)
+    PLTR: 2026-05-10    # Palantir
+    SNOW: 2026-05-10    # Snowflake
+    CRWD: 2026-05-10    # CrowdStrike
+    DDOG: 2026-05-10    # Datadog
+    SHOP: 2026-05-10    # Shopify (Canada-listed but US-traded)
+    ARM: 2026-05-10     # Arm Holdings
+    COIN: 2026-05-10    # Coinbase
+    # Semi/optical/networking expansion 2026-05-11 (user-requested AI-sphere)
+    MU: 2026-05-11      # Micron (memory)
+    MRVL: 2026-05-11    # Marvell (custom silicon)
+    KLAC: 2026-05-11    # KLA Corp (semicap)
+    MCHP: 2026-05-11    # Microchip (analog/MCU)
+    "ON": 2026-05-11    # ON Semiconductor (power/auto) — quoted because YAML parses bare ON as boolean True
+    LITE: 2026-05-11    # Lumentum (optical components for AI datacenters)
+    ANET: 2026-05-11    # Arista Networks (AI datacenter networking)
+    # JNPR was acquired by HPE in 7/2025; skip
+    MPWR: 2026-05-11    # Monolithic Power (power semis)
+    # Financials
+    JPM: 2026-04-25
+    BAC: 2026-04-25
+    WFC: 2026-04-25
+    GS: 2026-04-25
+    MS: 2026-04-25
+    C: 2026-04-25
+    SCHW: 2026-04-25
+    BLK: 2026-04-25
+    AXP: 2026-04-25
+    V: 2026-04-25
+    MA: 2026-04-25
+    SPGI: 2026-04-25
+    BRK.B: 2026-05-10   # Berkshire Hathaway (added 2026-05-10)
+    # Healthcare
+    UNH: 2026-04-25
+    JNJ: 2026-04-25
+    LLY: 2026-04-25
+    PFE: 2026-04-25
+    MRK: 2026-04-25
+    ABBV: 2026-04-25
+    TMO: 2026-04-25
+    ABT: 2026-04-25
+    DHR: 2026-04-25
+    BMY: 2026-04-25
+    AMGN: 2026-04-25
+    GILD: 2026-04-25
+    CVS: 2026-04-25
+    # Consumer discretionary
+    HD: 2026-04-25
+    MCD: 2026-04-25
+    NKE: 2026-04-25
+    LOW: 2026-04-25
+    SBUX: 2026-04-25
+    TJX: 2026-04-25
+    BKNG: 2026-04-25
+    ABNB: 2026-05-10    # Airbnb (added 2026-05-10)
+    F: 2026-05-10       # Ford
+    GM: 2026-05-10      # General Motors
+    # Consumer staples
+    WMT: 2026-04-25
+    PG: 2026-04-25
+    KO: 2026-04-25
+    PEP: 2026-04-25
+    COST: 2026-04-25
+    PM: 2026-04-25
+    MO: 2026-04-25
+    # Industrials
+    CAT: 2026-04-25
+    HON: 2026-04-25
+    UPS: 2026-04-25
+    BA: 2026-04-25
+    DE: 2026-04-25
+    GE: 2026-04-25
+    LMT: 2026-04-25
+    RTX: 2026-04-25
+    UBER: 2026-05-10    # Uber (added 2026-05-10)
+    # Energy
+    XOM: 2026-04-25
+    CVX: 2026-04-25
+    COP: 2026-04-25
+    SLB: 2026-04-25
+    # Materials / utilities
+    LIN: 2026-04-25
+    APD: 2026-04-25
+    NEE: 2026-04-25
+    DUK: 2026-04-25
+    # Comms / media
+    DIS: 2026-04-25
+    NFLX: 2026-04-25
+    CMCSA: 2026-04-25
+    T: 2026-04-25
+    VZ: 2026-04-25
+    TMUS: 2026-05-10    # T-Mobile US (added 2026-05-10)
+    WBD: 2026-05-11     # Warner Bros Discovery
+    ROKU: 2026-05-11    # Roku (CTV ad-tech)
+    # Cross-sector mega-cap sweep 2026-05-11 (proactive broader expansion)
+    # Consumer Discretionary
+    CMG: 2026-05-11     # Chipotle
+    LULU: 2026-05-11    # Lululemon
+    ULTA: 2026-05-11    # Ulta Beauty
+    MAR: 2026-05-11     # Marriott
+    HLT: 2026-05-11     # Hilton
+    DASH: 2026-05-11    # DoorDash
+    # Consumer Staples
+    MDLZ: 2026-05-11    # Mondelez
+    TGT: 2026-05-11     # Target
+    # Energy
+    EOG: 2026-05-11     # EOG Resources
+    OXY: 2026-05-11     # Occidental
+    MPC: 2026-05-11     # Marathon Petroleum
+    # Financials
+    USB: 2026-05-11     # US Bancorp
+    PNC: 2026-05-11     # PNC Financial
+    ICE: 2026-05-11     # Intercontinental Exchange
+    CME: 2026-05-11     # CME Group
+    BX: 2026-05-11      # Blackstone
+    KKR: 2026-05-11     # KKR
+    # Healthcare
+    MDT: 2026-05-11     # Medtronic
+    ISRG: 2026-05-11    # Intuitive Surgical
+    ELV: 2026-05-11     # Elevance Health
+    REGN: 2026-05-11    # Regeneron
+    VRTX: 2026-05-11    # Vertex Pharmaceuticals
+    BSX: 2026-05-11     # Boston Scientific
+    # Industrials
+    GD: 2026-05-11      # General Dynamics
+    FDX: 2026-05-11     # FedEx
+    UNP: 2026-05-11     # Union Pacific
+    NOC: 2026-05-11     # Northrop Grumman
+    # Information Technology
+    ASML: 2026-05-11    # ASML Holdings (semicap equipment)
+    ADI: 2026-05-11     # Analog Devices
+    NXPI: 2026-05-11    # NXP Semiconductors
+    FTNT: 2026-05-11    # Fortinet
+    PANW: 2026-05-11    # Palo Alto Networks
+    NET: 2026-05-11     # Cloudflare
+    # Materials
+    ECL: 2026-05-11     # Ecolab
+    SHW: 2026-05-11     # Sherwin-Williams
+    # Utilities
+    SO: 2026-05-11      # Southern Company
+    AEP: 2026-05-11     # American Electric Power
+    # Universe expansion 2026-05-24 — categories the prior universe lacked
+    # entirely or covered too thin. Picked by market cap + sector hole, not by
+    # single-name preference.
+    # Data center + REIT (no prior real-estate coverage; AI infra demand)
+    EQIX: 2026-05-24    # Equinix (data center REIT)
+    DLR: 2026-05-24     # Digital Realty (data center REIT)
+    AMT: 2026-05-24     # American Tower (cell-tower REIT)
+    PLD: 2026-05-24     # Prologis (industrial REIT)
+    O: 2026-05-24       # Realty Income (net-lease REIT)
+    VICI: 2026-05-24    # VICI Properties (casino REIT)
+    # Insurance (Financials sub-sector previously absent)
+    PGR: 2026-05-24     # Progressive
+    CB: 2026-05-24      # Chubb
+    MET: 2026-05-24     # MetLife
+    AIG: 2026-05-24     # AIG
+    # Fintech (modern payment / lending names)
+    SOFI: 2026-05-24    # SoFi Technologies
+    HOOD: 2026-05-24    # Robinhood
+    AFRM: 2026-05-24    # Affirm
+    # Gaming / interactive entertainment
+    DKNG: 2026-05-24    # DraftKings
+    EA: 2026-05-24      # Electronic Arts
+    TTWO: 2026-05-24    # Take-Two Interactive
+    RBLX: 2026-05-24    # Roblox
+    # Clean energy
+    ENPH: 2026-05-24    # Enphase Energy
+    FSLR: 2026-05-24    # First Solar
+    # Steel + metals + mining (Materials gap)
+    NUE: 2026-05-24     # Nucor
+    FCX: 2026-05-24     # Freeport-McMoRan (copper)
+    NEM: 2026-05-24     # Newmont (gold)
+    # EV
+    RIVN: 2026-05-24    # Rivian
+    # Biotech
+    MRNA: 2026-05-24    # Moderna
+    # Software (cross-sector enterprise)
+    WDAY: 2026-05-24    # Workday
+    # Crypto-leveraged equity proxy
+    MSTR: 2026-05-24    # MicroStrategy
+    # Industrials specialty
+    EMR: 2026-05-24     # Emerson Electric
+    ETN: 2026-05-24     # Eaton
+    # Consumer discretionary / staples
+    BBY: 2026-05-24     # Best Buy
+    MNST: 2026-05-24    # Monster Beverage
+    # Comms / streaming
+    SPOT: 2026-05-24    # Spotify
+
+    # 2026-06-12 universe expansion: +81 liquid large/mid caps targeting
+    # underweight sectors (strategy review: 187 names / 48 IT was too
+    # narrow + lopsided for a cross-sectional ranker; breadth feeds the
+    # sector-relative scoring shipped today). Prices backfilled to 2023.
+    ITW: 2026-06-12          # Industrials
+    PH: 2026-06-12          # Industrials
+    CMI: 2026-06-12          # Industrials
+    ROK: 2026-06-12          # Industrials
+    CSX: 2026-06-12          # Industrials
+    NSC: 2026-06-12          # Industrials
+    DAL: 2026-06-12          # Industrials
+    UAL: 2026-06-12          # Industrials
+    LUV: 2026-06-12          # Industrials
+    WM: 2026-06-12          # Industrials
+    RSG: 2026-06-12          # Industrials
+    PCAR: 2026-06-12          # Industrials
+    CARR: 2026-06-12          # Industrials
+    OTIS: 2026-06-12          # Industrials
+    JCI: 2026-06-12          # Industrials
+    FAST: 2026-06-12          # Industrials
+    URI: 2026-06-12          # Industrials
+    PWR: 2026-06-12          # Industrials
+    AME: 2026-06-12          # Industrials
+    CPRT: 2026-06-12          # Industrials
+    ODFL: 2026-06-12          # Industrials
+    PSX: 2026-06-12          # Energy
+    VLO: 2026-06-12          # Energy
+    WMB: 2026-06-12          # Energy
+    KMI: 2026-06-12          # Energy
+    HAL: 2026-06-12          # Energy
+    DVN: 2026-06-12          # Energy
+    FANG: 2026-06-12          # Energy
+    BKR: 2026-06-12          # Energy
+    CL: 2026-06-12          # Consumer Staples
+    KMB: 2026-06-12          # Consumer Staples
+    GIS: 2026-06-12          # Consumer Staples
+    SYY: 2026-06-12          # Consumer Staples
+    KR: 2026-06-12          # Consumer Staples
+    STZ: 2026-06-12          # Consumer Staples
+    HSY: 2026-06-12          # Consumer Staples
+    KDP: 2026-06-12          # Consumer Staples
+    CHD: 2026-06-12          # Consumer Staples
+    DG: 2026-06-12          # Consumer Staples
+    D: 2026-06-12          # Utilities
+    EXC: 2026-06-12          # Utilities
+    SRE: 2026-06-12          # Utilities
+    XEL: 2026-06-12          # Utilities
+    ED: 2026-06-12          # Utilities
+    WEC: 2026-06-12          # Utilities
+    PEG: 2026-06-12          # Utilities
+    ES: 2026-06-12          # Utilities
+    DOW: 2026-06-12          # Materials
+    DD: 2026-06-12          # Materials
+    VMC: 2026-06-12          # Materials
+    MLM: 2026-06-12          # Materials
+    ALB: 2026-06-12          # Materials
+    CCI: 2026-06-12          # Real Estate
+    PSA: 2026-06-12          # Real Estate
+    SPG: 2026-06-12          # Real Estate
+    WELL: 2026-06-12          # Real Estate
+    AVB: 2026-06-12          # Real Estate
+    CI: 2026-06-12          # Health Care
+    HUM: 2026-06-12          # Health Care
+    MCK: 2026-06-12          # Health Care
+    SYK: 2026-06-12          # Health Care
+    BDX: 2026-06-12          # Health Care
+    ZTS: 2026-06-12          # Health Care
+    BRK-B: 2026-06-12          # Financials
+    AON: 2026-06-12          # Financials
+    TFC: 2026-06-12          # Financials
+    ALL: 2026-06-12          # Financials
+    AFL: 2026-06-12          # Financials
+    TRV: 2026-06-12          # Financials
+    CHTR: 2026-06-12          # Communication Services
+    OMC: 2026-06-12          # Communication Services
+    ORLY: 2026-06-12          # Consumer Discretionary
+    AZO: 2026-06-12          # Consumer Discretionary
+    ROST: 2026-06-12          # Consumer Discretionary
+    YUM: 2026-06-12          # Consumer Discretionary
+    DHI: 2026-06-12          # Consumer Discretionary
+    LEN: 2026-06-12          # Consumer Discretionary
+    EBAY: 2026-06-12          # Consumer Discretionary
+    DPZ: 2026-06-12          # Consumer Discretionary

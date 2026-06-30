@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sma.house-ingest.weekly</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/caffeinate</string>
+		<string>-s</string>
+		<string>/Users/youruser/code/Stock-Market-Predictor-Agents/.venv/bin/python</string>
+		<string>-m</string>
+		<string>sma.ingest.sources.politician_trades</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/youruser/code/Stock-Market-Predictor-Agents</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin</string>
+		<key>TZ</key>
+		<string>America/New_York</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Weekday</key>
+			<integer>0</integer>
+			<key>Hour</key>
+			<integer>11</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+	</array>
+	<key>StandardOutPath</key>
+	<string>/Users/youruser/Library/Logs/sma/house-ingest.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/youruser/Library/Logs/sma/house-ingest.err.log</string>
+	<key>RunAtLoad</key>
+	<false/>
+</dict>
+</plist>

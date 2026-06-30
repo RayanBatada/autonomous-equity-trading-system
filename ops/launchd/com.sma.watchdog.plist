@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sma.watchdog</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/caffeinate</string>
+		<string>-s</string>
+		<string>/Users/youruser/code/Stock-Market-Predictor-Agents/.venv/bin/python</string>
+		<string>-m</string>
+		<string>sma.watchdog</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/youruser/code/Stock-Market-Predictor-Agents</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin</string>
+		<key>TZ</key>
+		<string>America/New_York</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>19</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Hour</key>
+			<integer>20</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Hour</key>
+			<integer>21</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+		<dict>
+			<key>Hour</key>
+			<integer>22</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+		</dict>
+	</array>
+	<key>StandardOutPath</key>
+	<string>/Users/youruser/Library/Logs/sma/watchdog.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/youruser/Library/Logs/sma/watchdog.err.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>

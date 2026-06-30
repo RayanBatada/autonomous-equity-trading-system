@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sma.dashboard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/caffeinate</string>
+		<string>-i</string>
+		<string>/Users/youruser/code/Stock-Market-Predictor-Agents/.venv/bin/streamlit</string>
+		<string>run</string>
+		<string>dashboard/app.py</string>
+		<string>--server.port</string>
+		<string>8765</string>
+		<string>--server.headless</string>
+		<string>true</string>
+		<string>--browser.gatherUsageStats</string>
+		<string>false</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/youruser/code/Stock-Market-Predictor-Agents</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin</string>
+		<key>TZ</key>
+		<string>America/New_York</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/youruser/Library/Logs/sma/dashboard.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/youruser/Library/Logs/sma/dashboard.err.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+</dict>
+</plist>
