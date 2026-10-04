@@ -14,16 +14,19 @@ and exits without touching the reconcile-sentinel directory.
 from __future__ import annotations
 
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from click.testing import CliRunner
 
 from sma.ingest.store import Store
 from sma.live.__main__ import reconcile_cmd
+
+ET = ZoneInfo("America/New_York")
 
 
 @pytest.fixture
@@ -60,6 +63,24 @@ def _stub_settings_and_alpaca(monkeypatch, *, equity: float = 100_000.0) -> Magi
     fake.get_orders_for_date.return_value = []
     fake.get_order_by_id.return_value = _open_order_mock()
     fake.next_session_date.return_value = date(2099, 1, 1)
+    # These tests run at the real wall clock, which is usually past the 16:10 ET
+    # after-hours cutoff, so the snapshot asks for a portfolio-history close.
+    # None = "not published yet" -> fall back to the get_account equity these
+    # tests assert on. Equity sourcing itself is covered in
+    # tests/unit/live/test_snapshot_equity_source.py.
+    fake.session_close_equity.return_value = None
+    # backfill_missing_snapshots (2026-08-20) runs a calendar lookup at the
+    # start of every reconcile — an empty session list makes it a deterministic
+    # no-op for these tests, same posture as session_close_equity above.
+    fake.sessions_between.return_value = []
+    # _pre_close_skip_reason (2026-08-20) gates the same-day snapshot write on
+    # whether `today`'s session has closed. These tests run at the real wall
+    # clock, so answer "already closed" regardless of what time that is —
+    # keyed off whatever day is asked about, close pinned to midnight ET so
+    # any later-that-day `now` is safely past it.
+    fake.session_window.side_effect = lambda *, day: (
+        datetime.combine(day, time(9, 30, tzinfo=ET)), datetime.combine(day, time(0, 0, tzinfo=ET))
+    )
     fake.tc = MagicMock()
 
     monkeypatch.setattr(_live_main, "load_settings", lambda config_path: SimpleNamespace())
@@ -112,6 +133,90 @@ def test_no_unreconciled_batches_writes_no_sentinel(isolated_sentinels, monkeypa
     assert sentinel_files == [], (
         f"phantom sentinel(s) leaked: {[f.name for f in sentinel_files]}"
     )
+
+
+def test_no_batches_path_logs_a_plain_boolean_snapshot_result(
+    isolated_sentinels, monkeypatch, tmp_path,
+):
+    """_write_account_snapshot returns (written, positions). Binding the whole
+    TUPLE dumped the position book into the log line and made a FAILED write
+    read as truthy — on the path that runs most days."""
+    db_path = _empty_db(tmp_path)
+    fake = _stub_settings_and_alpaca(monkeypatch)
+    fake.get_positions.return_value = {"AAPL": {"shares": 10, "cost_basis": 200.0}}
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("# stub\n")
+
+    result = CliRunner().invoke(
+        reconcile_cmd, ["--db", str(db_path), "--config", str(config_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "snapshot_written=True" in result.output
+    assert "AAPL" not in result.output, "the position book leaked into the log line"
+
+
+def test_no_batches_path_reports_a_failed_snapshot_as_false(
+    isolated_sentinels, monkeypatch, tmp_path,
+):
+    """A failed write returns (False, positions); the tuple binding made that
+    truthy, so a broken snapshot still logged snapshot_written=(...)."""
+    import sma.live.reconcile as _rc
+
+    db_path = _empty_db(tmp_path)
+    _stub_settings_and_alpaca(monkeypatch)
+    monkeypatch.setattr(
+        _rc, "_write_account_snapshot",
+        lambda **kw: (False, {"AAPL": {"shares": 10, "cost_basis": 200.0}}),
+    )
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("# stub\n")
+
+    result = CliRunner().invoke(
+        reconcile_cmd, ["--db", str(db_path), "--config", str(config_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "snapshot_written=False" in result.output
+
+
+def test_no_batches_path_skips_snapshot_before_session_close(
+    isolated_sentinels, monkeypatch, tmp_path,
+):
+    """Pre-open catch-up (e.g. the 2026-08-20 05:36 launchd re-fire after a
+    dark-machine reboot): the no-batches path must NOT write a same-day
+    account_snapshots row when today's session hasn't closed yet -- writing
+    one would price off whatever mark happens to be live before the open,
+    which is literally the PRIOR session's after-hours mark."""
+    from sma.live.__main__ import _today_et
+
+    db_path = _empty_db(tmp_path)
+    fake = _stub_settings_and_alpaca(monkeypatch)
+    today = _today_et()
+    # Override the shared helper's default "always closed" stub: report the
+    # session as still open (close far in the future relative to whenever
+    # this test actually runs, so it's deterministic regardless of time of day).
+    fake.session_window.side_effect = None
+    fake.session_window.return_value = (
+        datetime.combine(today, time(9, 30, tzinfo=ET)),
+        datetime.combine(today, time(23, 59, tzinfo=ET)),
+    )
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("# stub\n")
+
+    result = CliRunner().invoke(
+        reconcile_cmd, ["--db", str(db_path), "--config", str(config_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "snapshot_written=False" in result.output
+
+    store = Store(path=str(db_path)).connect(read_only=True)
+    try:
+        count = store.conn.execute("SELECT COUNT(*) FROM account_snapshots").fetchone()[0]
+    finally:
+        store.close()
+    assert count == 0, "no phantom row should be written before the session closes"
 
 
 def test_all_batches_already_reconciled_writes_no_sentinel(
@@ -210,6 +315,24 @@ def test_sentinel_deferred_when_next_session_open_in_future(
     # (rather than the calendar-failure fallback that would write the sentinel
     # anyway).
     fake.next_session_date.return_value = _today_et() + timedelta(days=2)
+    # These tests run at the real wall clock, which is usually past the 16:10 ET
+    # after-hours cutoff, so the snapshot asks for a portfolio-history close.
+    # None = "not published yet" -> fall back to the get_account equity these
+    # tests assert on. Equity sourcing itself is covered in
+    # tests/unit/live/test_snapshot_equity_source.py.
+    fake.session_close_equity.return_value = None
+    # backfill_missing_snapshots (2026-08-20) runs a calendar lookup at the
+    # start of every reconcile — an empty session list makes it a deterministic
+    # no-op for these tests, same posture as session_close_equity above.
+    fake.sessions_between.return_value = []
+    # _pre_close_skip_reason (2026-08-20) gates the same-day snapshot write on
+    # whether `today`'s session has closed. These tests run at the real wall
+    # clock, so answer "already closed" regardless of what time that is —
+    # keyed off whatever day is asked about, close pinned to midnight ET so
+    # any later-that-day `now` is safely past it.
+    fake.session_window.side_effect = lambda *, day: (
+        datetime.combine(day, time(9, 30, tzinfo=ET)), datetime.combine(day, time(0, 0, tzinfo=ET))
+    )
     fake.tc = MagicMock()
 
     import sma.live.__main__ as _live_main
@@ -274,6 +397,24 @@ def test_sentinel_deferred_when_next_session_implausibly_far_out(
     fake.get_order_by_id.return_value = _open_order_mock()
     # 60 days out — implausible. Triggers the sanity bound.
     fake.next_session_date.return_value = _today_et() + timedelta(days=60)
+    # These tests run at the real wall clock, which is usually past the 16:10 ET
+    # after-hours cutoff, so the snapshot asks for a portfolio-history close.
+    # None = "not published yet" -> fall back to the get_account equity these
+    # tests assert on. Equity sourcing itself is covered in
+    # tests/unit/live/test_snapshot_equity_source.py.
+    fake.session_close_equity.return_value = None
+    # backfill_missing_snapshots (2026-08-20) runs a calendar lookup at the
+    # start of every reconcile — an empty session list makes it a deterministic
+    # no-op for these tests, same posture as session_close_equity above.
+    fake.sessions_between.return_value = []
+    # _pre_close_skip_reason (2026-08-20) gates the same-day snapshot write on
+    # whether `today`'s session has closed. These tests run at the real wall
+    # clock, so answer "already closed" regardless of what time that is —
+    # keyed off whatever day is asked about, close pinned to midnight ET so
+    # any later-that-day `now` is safely past it.
+    fake.session_window.side_effect = lambda *, day: (
+        datetime.combine(day, time(9, 30, tzinfo=ET)), datetime.combine(day, time(0, 0, tzinfo=ET))
+    )
     fake.tc = MagicMock()
 
     import sma.live.__main__ as _live_main
@@ -327,6 +468,24 @@ def test_sentinel_deferred_when_calendar_lookup_fails(
     fake.get_order_by_id.return_value = _open_order_mock()
     # Calendar lookup itself blows up.
     fake.next_session_date.side_effect = RuntimeError("alpaca calendar unreachable")
+    # These tests run at the real wall clock, which is usually past the 16:10 ET
+    # after-hours cutoff, so the snapshot asks for a portfolio-history close.
+    # None = "not published yet" -> fall back to the get_account equity these
+    # tests assert on. Equity sourcing itself is covered in
+    # tests/unit/live/test_snapshot_equity_source.py.
+    fake.session_close_equity.return_value = None
+    # backfill_missing_snapshots (2026-08-20) runs a calendar lookup at the
+    # start of every reconcile — an empty session list makes it a deterministic
+    # no-op for these tests, same posture as session_close_equity above.
+    fake.sessions_between.return_value = []
+    # _pre_close_skip_reason (2026-08-20) gates the same-day snapshot write on
+    # whether `today`'s session has closed. These tests run at the real wall
+    # clock, so answer "already closed" regardless of what time that is —
+    # keyed off whatever day is asked about, close pinned to midnight ET so
+    # any later-that-day `now` is safely past it.
+    fake.session_window.side_effect = lambda *, day: (
+        datetime.combine(day, time(9, 30, tzinfo=ET)), datetime.combine(day, time(0, 0, tzinfo=ET))
+    )
     fake.tc = MagicMock()
 
     import sma.live.__main__ as _live_main
@@ -403,6 +562,24 @@ def test_sentinel_deferred_when_an_order_fetch_fails(
     fake.get_orders_for_date.return_value = []
     fake.get_order_by_id.side_effect = _by_id
     fake.next_session_date.return_value = date(2026, 4, 30)
+    # These tests run at the real wall clock, which is usually past the 16:10 ET
+    # after-hours cutoff, so the snapshot asks for a portfolio-history close.
+    # None = "not published yet" -> fall back to the get_account equity these
+    # tests assert on. Equity sourcing itself is covered in
+    # tests/unit/live/test_snapshot_equity_source.py.
+    fake.session_close_equity.return_value = None
+    # backfill_missing_snapshots (2026-08-20) runs a calendar lookup at the
+    # start of every reconcile — an empty session list makes it a deterministic
+    # no-op for these tests, same posture as session_close_equity above.
+    fake.sessions_between.return_value = []
+    # _pre_close_skip_reason (2026-08-20) gates the same-day snapshot write on
+    # whether `today`'s session has closed. These tests run at the real wall
+    # clock, so answer "already closed" regardless of what time that is —
+    # keyed off whatever day is asked about, close pinned to midnight ET so
+    # any later-that-day `now` is safely past it.
+    fake.session_window.side_effect = lambda *, day: (
+        datetime.combine(day, time(9, 30, tzinfo=ET)), datetime.combine(day, time(0, 0, tzinfo=ET))
+    )
     fake.tc = MagicMock()
 
     import sma.live.__main__ as _live_main
@@ -438,7 +615,7 @@ def test_resolve_reconcile_asof_rediscovers_batch_after_status_updated(
     still be re-discoverable. Selection keys off placed orders (alpaca_order_id),
     not status='submitted' — otherwise the batch is stranded (no sentinel + no
     'submitted' rows = invisible forever)."""
-    from sma.live.__main__ import _resolve_reconcile_asof
+    from sma.live.__main__ import _resolve_reconcile_asofs
 
     asof = date(2026, 5, 22)
     db_path = _db_with_pre_reconciled_batch(tmp_path, asof=asof)  # id set, no sentinel
@@ -448,7 +625,7 @@ def test_resolve_reconcile_asof_rediscovers_batch_after_status_updated(
         store.conn.execute(
             "UPDATE intended_orders SET status='filled' WHERE asof_date=?", [asof]
         )
-        assert _resolve_reconcile_asof(None, store) == asof
+        assert _resolve_reconcile_asofs(None, store) == [asof]
     finally:
         store.close()
 
@@ -510,3 +687,43 @@ def test_liveness_sentinel_records_reconciled_batch_asof(
     )
     assert live is not None
     assert live["reconciled_asof"] == yesterday.isoformat()
+
+
+def test_reconcile_drains_all_unreconciled_batches_in_one_run(
+    isolated_sentinels, monkeypatch, tmp_path
+):
+    """2026-07-01 HIGH: the old newest-first single-batch pick permanently
+    stranded any older unreconciled batch (a deferral's 'will retry next
+    cycle' could never happen — the next run grabbed the newer batch).
+    One run must now process EVERY sentinel-less batch, oldest first."""
+    fake = _stub_settings_and_alpaca(monkeypatch)
+
+    db_path = tmp_path / "test.duckdb"
+    store = Store(path=str(db_path)).connect()
+    rid = store.allocate_run_id()
+    for asof, ticker, oid in [
+        (date(2026, 4, 27), "AAPL", "alpaca-1"),
+        (date(2026, 4, 28), "MSFT", "alpaca-2"),
+    ]:
+        store.conn.execute(
+            """
+            INSERT INTO intended_orders
+            (intended_order_id, asof_date, ticker, side, target_shares,
+             target_weight, last_price, source, alpaca_order_id, status, run_id)
+            VALUES (?, ?, ?, 'BUY', 10, NULL, 200.0, 'decide', ?, 'submitted', ?)
+            """,
+            [str(uuid.uuid4()), asof, ticker, oid, rid],
+        )
+    store.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        reconcile_cmd, ["--db", str(db_path), "--config", "config.yaml"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    # BOTH batches were processed this run — oldest first
+    assert "reconcile[2026-04-27]" in result.output
+    assert "reconcile[2026-04-28]" in result.output
+    fetched = {c.args[0] for c in fake.get_order_by_id.call_args_list}
+    assert {"alpaca-1", "alpaca-2"} <= fetched

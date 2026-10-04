@@ -11,6 +11,7 @@ import click
 
 from sma.backtest.overfit import detect_overfit
 from sma.backtest.result import BacktestResult
+from sma.backtest.simulator import DEFAULT_INITIAL_CASH
 from sma.backtest.strategies.base import Strategy
 from sma.eval.evaluate_strategy import _load_prices_for_window, evaluate_strategy
 from sma.ingest.universe import load_universe
@@ -102,6 +103,11 @@ def cli() -> None:
               show_default=True,
               help="(xgb_top_k only) Sector-relative scoring strength λ in [0,1]; "
                    "0=plain top-K, 1=rank on within-sector relative strength.")
+@click.option("--initial-cash", type=click.FloatRange(min=0.0, min_open=True),
+              default=DEFAULT_INITIAL_CASH, show_default=True,
+              help="Starting capital. Was hardcoded to $100k; it is a parameter "
+                   "because whole-share sizing behaves very differently at $50, "
+                   "$10k and $10M — see live.sizing in config.yaml.")
 def evaluate(
     strategy: str,
     window: str,
@@ -109,6 +115,7 @@ def evaluate(
     i_promise_this_is_a_promotion_decision: bool,
     use_theses: bool,
     sector_neutralize: float,
+    initial_cash: float,
 ) -> None:
     universe = _get_universe()
     s = _build_strategy(
@@ -127,6 +134,7 @@ def evaluate(
             # by design until a true point-in-time membership map exists
             membership="current",
             strategy=s,
+            initial_cash=initial_cash,
             window=window,  # type: ignore[arg-type]
             universe=universe,
             rails=eval_rails,
@@ -198,7 +206,7 @@ def _spy_simulated_return(db_path: Path) -> float:
     +1.05% SPY drift caught by this very gate).
     """
     from sma.backtest.risk import RiskRails
-    from sma.backtest.simulator import simulate
+    from sma.backtest.simulator import DEFAULT_INITIAL_CASH, simulate
     from sma.backtest.slippage import SlippageModel
     from sma.backtest.strategies.buy_and_hold_spy import BuyAndHoldSPYStrategy
 
@@ -217,7 +225,7 @@ def _spy_simulated_return(db_path: Path) -> float:
         window_name="verify",
         start_date=first_day,
         end_date=last_day,
-        initial_cash=100_000.0,
+        initial_cash=DEFAULT_INITIAL_CASH,
         slippage_model=SlippageModel(),
         rails=RiskRails(
             max_position_pct=1.0,

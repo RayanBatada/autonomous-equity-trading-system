@@ -48,3 +48,36 @@ def test_exhausts_retries_then_reraises_lock_error():
         read_only_connect(
             "x.duckdb", retries=3, base_delay=0.0, max_delay=0.0, _connect=fake_connect
         )
+
+
+def test_writable_connect_retries_lock_conflicts_then_succeeds(monkeypatch):
+    """2026-07-02: a job's writable open used to die instantly if it landed
+    inside a dashboard read-connection's window (duckdb: one writer XOR N
+    readers across processes — flock can't arbitrate that). Retry like the
+    read path."""
+    from sma.db_connect import writable_connect
+
+    monkeypatch.setattr("sma.db_connect.time.sleep", lambda s: None)
+    attempts = []
+
+    def fake_connect(path, read_only):
+        attempts.append(read_only)
+        if len(attempts) < 3:
+            raise RuntimeError("IO Error: Could not set lock on file")
+        return "CONN"
+
+    assert writable_connect("x.duckdb", _connect=fake_connect) == "CONN"
+    assert attempts == [False, False, False]
+
+
+def test_writable_connect_reraises_non_lock_errors(monkeypatch):
+    from sma.db_connect import writable_connect
+
+    def fake_connect(path, read_only):
+        raise RuntimeError("Catalog Error: whatever")
+
+    try:
+        writable_connect("x.duckdb", _connect=fake_connect)
+        raise AssertionError("should have raised")
+    except RuntimeError as e:
+        assert "Catalog" in str(e)

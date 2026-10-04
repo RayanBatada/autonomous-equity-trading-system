@@ -418,7 +418,13 @@ def _main() -> None:
 
     from sma.ingest.store import Store
     from sma.locks import writer_lock
-    with writer_lock(label="politician_ingest"):
+    # 2026-08-23: paired with senate-ingest's writer_lock, this timeout was
+    # widened for the same reason — see the comment in
+    # src/sma/ingest/sources/senate_trades.py's writer_lock call for the
+    # full incident. House happened to win that race and finish in under a
+    # minute; a patient timeout means the LOSER of a future boot-catchup
+    # race waits instead of failing.
+    with writer_lock(label="politician_ingest", timeout_s=900.0):
         store = Store(path=str(args.db)).connect()
         try:
             rid = store.allocate_run_id()
@@ -427,6 +433,23 @@ def _main() -> None:
             print(f"summary: {summary}")
         finally:
             store.conn.close()
+        # Sentinel INSIDE the writer lock, success-only — without it the watchdog
+        # could never see this Sunday job as done (review 2026-07-20 HIGH).
+        # NOTE: datetime/UTC/date are module-level imports; re-importing them here
+        # would shadow the module names for the WHOLE function (UnboundLocalError
+        # at the --year default above).
+        from sma.sentinels import write_sentinel
+        write_sentinel(
+            label="com.sma.house-ingest.weekly",
+            asof=date.today(),
+            payload={
+                "label": "com.sma.house-ingest.weekly",
+                "asof": date.today().isoformat(),
+                "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "run_id": rid,
+                "summary": str(summary),
+            },
+        )
 
 
 if __name__ == "__main__":

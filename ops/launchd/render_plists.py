@@ -101,6 +101,11 @@ def _program_args(label: str, venv_python: str) -> list[str]:
         "com.sma.monitoring.daily": ["-m", "sma.monitoring", "check"],
         "com.sma.senate-ingest.weekly": ["-m", "sma.ingest.sources.senate_trades"],
         "com.sma.house-ingest.weekly": ["-m", "sma.ingest.sources.politician_trades"],
+        "com.sma.weekly-digest.weekly": ["-m", "sma.monitoring", "weekly-digest"],
+        # OPTIONAL_SCHEDULE (2026-09-26): rendered, never installed by install.sh.
+        "com.sma.ingest.intraday": ["-m", "sma.ingest", "intraday"],
+        "com.sma.live.session.midday": ["-m", "sma.live", "session", "--name", "midday"],
+        "com.sma.live.session.close": ["-m", "sma.live", "session", "--name", "close"],
     }
     extra = _map.get(label)
     if extra is None:
@@ -155,7 +160,27 @@ def _render_watchdog_plist(
     venv: Path,
     home_dir: Path,
 ) -> dict:
-    """Render the watchdog plist: hourly checkpoints 19-22 ET, RunAtLoad=true."""
+    """Render the watchdog plist: checkpoints 10/13/16 + 19-23 ET + 0:30/1:30
+    overnight, RunAtLoad=true.
+
+    19-23: evening pipeline checks; 23:00 catches a missed backup.daily (fires
+    22:00, deadline 22:30 — review 2026-07-04). 10/13/16: DAYTIME checkpoints so
+    a Mac that slept through the early slots (Mon 04:00 retrain / 07:00
+    autoresearch, Sun 10:00/11:00 senate/house) and wakes midday is caught while
+    those jobs are still inside their per-job late-kick windows — with only the
+    19:00 first check, every wake-after-sleep was "too late to kick" and the
+    model went a week stale (2026-07-13/20).
+
+    0:30/1:30 (2026-08-05 post-mortem): a battery-slowed Mac let 8/4's ingest
+    run 18:30->23:54 (5.5h) holding the writer lock, past the last evening
+    checkpoint (23:00) — so predict/decide's late-kick windows (deadline+6h:
+    predict 19:45->01:45, decide 21:00->03:00) never got a checkpoint inside
+    them, nothing re-kicked predict once ingest finally released the lock, and
+    decide correctly refused to trade on stale/missing predictions. These two
+    overnight checkpoints land inside both windows so a chain that finishes
+    very late still gets one more chance to self-heal instead of losing the
+    whole night's rebalance.
+    """
     venv_python = str(venv / "bin" / "python")
     return {
         "Label": "com.sma.watchdog",
@@ -172,7 +197,16 @@ def _render_watchdog_plist(
             # host on ET. Documented limitation; flag if you travel.
             "TZ": "America/New_York",
         },
-        "StartCalendarInterval": [{"Hour": h, "Minute": 0} for h in (19, 20, 21, 22)],
+        "StartCalendarInterval": [
+            {"Hour": h, "Minute": 0} for h in (10, 13, 16, 19, 20, 21, 22, 23)
+        ] + [
+            # Overnight checkpoints (2026-08-05, see docstring): half-past so
+            # they sit inside both predict's (closes 01:45) and decide's
+            # (closes 03:00) late-kick windows rather than landing exactly on
+            # a boundary.
+            {"Hour": 0, "Minute": 30},
+            {"Hour": 1, "Minute": 30},
+        ],
         "StandardOutPath": f"{home_dir}/Library/Logs/sma/watchdog.out.log",
         "StandardErrorPath": f"{home_dir}/Library/Logs/sma/watchdog.err.log",
         "RunAtLoad": True,
@@ -214,17 +248,21 @@ def render_all(
     venv: Path,
     home_dir: Path,
 ) -> None:
-    """Render all 14 SMA plists into out_dir.
+    """Render all 18 SMA plists into out_dir.
 
-    1. 12 plists from SCHEDULE (one per job, including house/senate weekly).
+    1. 13 plists from SCHEDULE (one per job, including house/senate/weekly-digest),
+       plus 3 from OPTIONAL_SCHEDULE (intraday ingest + the two sessions; never
+       installed by install.sh).
     2. com.sma.watchdog (hourly checkpoints, not in SCHEDULE).
     3. com.sma.dashboard (long-running daemon, not in SCHEDULE).
     """
-    from sma.schedule import SCHEDULE
+    from sma.schedule import OPTIONAL_SCHEDULE, SCHEDULE
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for job in SCHEDULE:
+    # OPTIONAL_SCHEDULE plists are rendered next to the rest but install.sh's
+    # JOBS list does not include them: they ship unloaded (see README.md).
+    for job in (*SCHEDULE, *OPTIONAL_SCHEDULE):
         data = _render_schedule_plist(job, repo_root=repo_root, venv=venv, home_dir=home_dir)
         _write_plist(out_dir / f"{job.label}.plist", data)
 
@@ -312,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = args.out_dir if args.out_dir is not None else repo_root / "ops" / "launchd"
     render_all(out_dir=out_dir, repo_root=repo_root, venv=venv, home_dir=home_dir)
-    print(f"Rendered 14 plists to {out_dir}/")
+    print(f"Rendered 18 plists to {out_dir}/")
     return 0
 
 

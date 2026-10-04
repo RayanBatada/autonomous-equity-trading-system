@@ -1,5 +1,7 @@
 
 
+import pytest
+
 from sma.ingest.store import Store, current_schema_version
 
 
@@ -114,3 +116,47 @@ def test_migration_v3_idempotent(tmp_path):
     path = str(tmp_path / "v3_idempotent.duckdb")
     Store(path).connect().close()
     Store(path).connect().close()  # second connect should be safe
+
+
+def test_migration_v8_account_snapshots_non_equity_columns_are_nullable(tmp_path):
+    """2026-08-20: a gap-filled snapshot (backfill_missing_snapshots) knows
+    only the official equity close for a day reconcile never ran -- cash,
+    buying_power, long_market_value, and position_count are genuinely
+    unknowable in retrospect and must be storable as NULL. equity itself
+    stays NOT NULL."""
+    s = Store(":memory:").connect()
+    rid = s.allocate_run_id()
+    s.conn.execute(
+        """
+        INSERT INTO account_snapshots
+        (asof_date, equity, cash, buying_power, long_market_value,
+         position_count, total_unrealized_pnl, run_id, equity_source)
+        VALUES ('2026-08-19', 121_600.00, NULL, NULL, NULL, NULL, NULL, ?,
+                'portfolio_history_daily_close')
+        """,
+        [rid],
+    )
+    row = s.conn.execute(
+        "SELECT equity, cash, buying_power, long_market_value, position_count "
+        "FROM account_snapshots WHERE asof_date = '2026-08-19'"
+    ).fetchone()
+    assert row == (121_600.00, None, None, None, None)
+    s.close()
+
+
+def test_migration_v8_equity_still_required(tmp_path):
+    """equity was never relaxed -- a NULL equity row must still be rejected."""
+    s = Store(":memory:").connect()
+    rid = s.allocate_run_id()
+
+    with pytest.raises(Exception):
+        s.conn.execute(
+            """
+            INSERT INTO account_snapshots
+            (asof_date, equity, cash, buying_power, long_market_value,
+             position_count, total_unrealized_pnl, run_id, equity_source)
+            VALUES ('2026-08-19', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL)
+            """,
+            [rid],
+        )
+    s.close()

@@ -15,6 +15,7 @@ Prod DB is NEVER touched — we write only to the .sma-pit copy.
 """
 
 import duckdb
+import pandas as pd
 import yfinance as yf
 
 DB = "/Users/youruser/.sma-pit/sma-pit.duckdb"
@@ -70,7 +71,10 @@ for t in DECLINERS:
         d = d.date() if hasattr(d, "date") else d
         o, h, lo = r.get("Open"), r.get("High"), r.get("Low")
         c, ac, v = r.get("Close"), r.get("Adj Close"), r.get("Volume")
-        if c is None or ac is None:
+        # 2026-09-18 incident audit: `is None` doesn't catch a NaN close from a
+        # present-but-empty column (pandas stores that as NaN, not None) --
+        # never write a row whose close is NaN/None.
+        if c is None or ac is None or pd.isna(c) or pd.isna(ac):
             continue
         try:
             rows.append((t, d, float(o), float(h), float(lo), float(c),

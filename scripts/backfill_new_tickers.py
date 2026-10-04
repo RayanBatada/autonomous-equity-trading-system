@@ -7,6 +7,7 @@ import sys
 from datetime import date
 
 import duckdb
+import pandas as pd
 import yfinance as yf
 
 from sma.ingest.universe import load_universe_membership
@@ -29,8 +30,12 @@ for t in new:
         print(f"  {t}: NO DATA — prune from universe")
         continue
     for dt, r in sub.iterrows():
+        # Close is already NaN-guarded by dropna(subset=["Close"]) above; Adj
+        # Close alone can still be NaN -- store NULL, not NaN (2026-09-18
+        # incident audit).
+        adj_close = None if pd.isna(r["Adj Close"]) else float(r["Adj Close"])
         rows.append((t, dt.date(), float(r["Open"]), float(r["High"]), float(r["Low"]),
-                     float(r["Close"]), float(r["Adj Close"]), int(r["Volume"]), "yfinance"))
+                     float(r["Close"]), adj_close, int(r["Volume"]), "yfinance"))
 print(f"rows to insert: {len(rows)}")
 if not rows:
     sys.exit(1)

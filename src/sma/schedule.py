@@ -55,6 +55,37 @@ class JobSchedule:
     # for jobs whose primary sentinel is keyed by a different date (reconcile
     # keys its batch sentinel by the decide-date it reconciled, never today).
     liveness_sentinel_label: str | None = None
+    # Whether this job depends on a live market session. Market-sensitive jobs
+    # (ingest/predict/agents/decide/stop-loss/reconcile) produce no useful work
+    # on NYSE holidays, so the watchdog skips them on non-trading days. Jobs that
+    # run regardless of the market (retrain/autoresearch/backup/senate/house) set
+    # this False so a miss on a holiday Monday / weekend is still kicked + paged
+    # rather than silently suppressed by the holiday guard (review 2026-07-04).
+    requires_market_data: bool = True
+    # How long past the deadline the watchdog may still kick this job. The flat
+    # 6h default protects the evening pipeline from writer-lock collisions, but
+    # it stranded heavy market-independent jobs for a whole WEEK when the Mac
+    # slept through their early-morning slots (retrain missed entirely Mon
+    # 2026-07-13; the machine woke midday but 6h had passed). Widen per job
+    # where a later kick is still safe — bounded so the run completes clear of
+    # the 18:30 ET ingest / evening writer-lock traffic, INCLUDING when it
+    # serializes behind another late-kicked heavy job (review 2026-07-20 #3).
+    late_kick_max_hours: float = 6.0
+    # When True, the watchdog kicks this job only if every depends_on upstream
+    # has today's sentinel. Autoresearch enforces no dependency itself: kicked
+    # alongside retrain it races the heavy lock, searches against week-old
+    # weights, and its IC-gated winner loses to the later retrain artifact via
+    # the created-at tie-break (the 2026-06-19 bug, reintroducible by kick
+    # ordering — review 2026-07-20 #4).
+    kick_requires_upstream_sentinels: bool = False
+    # When True, a sentinel whose quality.passed is false does NOT count as
+    # done: the watchdog re-kicks the job (past deadline, idle, inside the
+    # late-kick window). Ingest only: its CLI already re-runs on a failed
+    # sentinel, and a dead network at 18:30 that is back by 21:00 is the
+    # commonest lost night (flaw hunt 2026-10-01 A1: 4 of 6 lost nights since
+    # 9/9). Not for agents: a re-run cannot fix exhausted API credit and it
+    # would hold the writer lock across decide.
+    rekick_on_failed_quality: bool = False
 
     def __post_init__(self) -> None:
         if not self.days:
@@ -71,6 +102,7 @@ SCHEDULE: tuple[JobSchedule, ...] = (
         depends_on=(),
         requires_writer_lock=True,
         waivers=frozenset({"newsapi_rate_limit", "theses_freshness"}),
+        rekick_on_failed_quality=True,
     ),
     JobSchedule(
         label="com.sma.model.predict.daily",
@@ -90,6 +122,13 @@ SCHEDULE: tuple[JobSchedule, ...] = (
             "news_per_ticker_minimum",
             "earnings_coverage",
             "no_cross_source_price_divergence",
+            # no_dead_or_frozen_tickers (2026-08-31) is blocking=False in code
+            # already (a single dead name must never freeze the whole book —
+            # see the EA/AVB corporate-action gap this check exists to close),
+            # so this waiver is belt-and-suspenders: "code and config agree"
+            # per the same Codex follow-up that added the divergence waiver
+            # above.
+            "no_dead_or_frozen_tickers",
         }),
     ),
     JobSchedule(
@@ -133,6 +172,9 @@ SCHEDULE: tuple[JobSchedule, ...] = (
             "news_per_ticker_minimum",
             "earnings_coverage",
             "no_cross_source_price_divergence",
+            # Belt-and-suspenders alongside blocking=False in code (see the
+            # predict job's waiver above for the full rationale).
+            "no_dead_or_frozen_tickers",
         }),
     ),
     JobSchedule(
@@ -174,6 +216,11 @@ SCHEDULE: tuple[JobSchedule, ...] = (
         depends_on=(),
         requires_writer_lock=True,
         waivers=frozenset(),
+        requires_market_data=False,  # trains on stored history; runs on holidays
+        # Kickable until 15:00 ET (deadline 07:00 + 8h): a ~2h retrain kicked at
+        # the last moment finishes ~17:00, clear of the 18:30 ingest. A missed
+        # retrain otherwise strands the model on week-old data (2026-07-13).
+        late_kick_max_hours=8.0,
     ),
     JobSchedule(
         label="com.sma.backup.daily",
@@ -184,6 +231,7 @@ SCHEDULE: tuple[JobSchedule, ...] = (
         depends_on=(),
         requires_writer_lock=True,
         waivers=frozenset(),
+        requires_market_data=False,  # runs 7 days; a missed backup must page
     ),
     JobSchedule(
         # 2026-05-18: moved Sun 03:00 ET → Mon 07:00 ET. Sunday's laptop-off
@@ -201,6 +249,15 @@ SCHEDULE: tuple[JobSchedule, ...] = (
         depends_on=("com.sma.model.retrain.weekly",),
         requires_writer_lock=True,
         waivers=frozenset(),
+        requires_market_data=False,  # config search on stored data; holiday-safe
+        # Kickable until 13:00 ET (deadline 10:00 + 3h) — sized for the
+        # SERIALIZED worst case: kicked at 13:00 behind a 13:00-kicked ~2h
+        # retrain, the ~2h search runs 15:00-17:00, still clear of the 18:30
+        # ingest. (5h looked safe per-job but the two jobs share the heavy
+        # lock; review 2026-07-20 #3.)
+        late_kick_max_hours=3.0,
+        # Never kick before today's retrain sentinel exists (see field docs).
+        kick_requires_upstream_sentinels=True,
     ),
     JobSchedule(
         # 2026-05-24: post-pipeline notifier. Fires after the watchdog's
@@ -234,6 +291,14 @@ SCHEDULE: tuple[JobSchedule, ...] = (
         depends_on=(),
         requires_writer_lock=True,
         waivers=frozenset(),
+        requires_market_data=False,  # Sunday disclosure refresh; never a market day
+        # Sundays have no market pipeline — only the 22:00 backup contends for the
+        # writer lock. Kickable until 20:00 ET (deadline 12:00 + 8h); the scrape
+        # typically runs well under an hour, finishing before the 22:00 backup
+        # even in the worst kick slot (and the 23:00 watchdog re-kicks the backup
+        # if it ever loses a lock race). Missed 7/12 + 7/19: the politician
+        # features went a week stale.
+        late_kick_max_hours=8.0,
     ),
     JobSchedule(
         # 2026-05-24: weekly House PTR refresh. Symmetric to Senate. House
@@ -251,12 +316,94 @@ SCHEDULE: tuple[JobSchedule, ...] = (
         depends_on=(),
         requires_writer_lock=True,
         waivers=frozenset(),
+        requires_market_data=False,  # Sunday disclosure refresh; never a market day
+        # Deadline 13:00 + 7h → kickable until 20:00 ET, same slot as senate; the
+        # cheap bulk-FD refresh finishes well before the 22:00 backup's lock.
+        late_kick_max_hours=7.0,
+    ),
+    JobSchedule(
+        # 2026-08-29: weekly "week in review" digest -- P&L, trading activity,
+        # live signal (IC), and ops health for the past week, so it reaches
+        # Rayan without him asking (see sma/monitoring/weekly_digest.py).
+        # Sunday 18:00 ET: after both weekly disclosure ingests (10:00/11:00)
+        # so its ops section can see today's senate/house sentinels, and well
+        # clear of the 22:00 backup. Never contends for the writer lock --
+        # everything it reads (account_snapshots, paper_fills,
+        # intended_orders, predictions, prices, plus sentinels and model
+        # artifacts) is read-only, and its only writes are a markdown file
+        # under ~/StockMarket/weekly/ and its own completion sentinel.
+        label="com.sma.weekly-digest.weekly",
+        days=(Day.SUN,),
+        fire_time_et=time(18, 0),
+        wake_lead_minutes=15,
+        deadline_offset_minutes=15,
+        depends_on=(),
+        requires_writer_lock=False,
+        waivers=frozenset(),
+        requires_market_data=False,  # Sunday review; never a market day
+        # Same Sunday-evening wake-risk margin as senate/house (8h/7h):
+        # kickable until ~02:15 ET Monday, comfortably clear of the 04:00
+        # retrain.
+        late_kick_max_hours=8.0,
+    ),
+)
+
+
+# OPTIONAL jobs (2026-09-26, strategy-expansion.md section 3): rendered to
+# plists/units like SCHEDULE, but NOT installed by ops/launchd/install.sh and
+# NOT in SCHEDULE, so nothing that iterates SCHEDULE (weekly digest, the
+# render counts, preflight) sees them. The watchdog evaluates one ONLY when the
+# OS scheduler reports it installed (SchedulerAdapter.installed), so a job
+# that ships disabled can never page. Enable per ops/launchd/README.md.
+_WEEKDAYS = (Day.MON, Day.TUE, Day.WED, Day.THU, Day.FRI)
+OPTIONAL_SCHEDULE: tuple[JobSchedule, ...] = (
+    JobSchedule(
+        # 1-minute IEX bars through ~15:40 for the close session. Idempotent,
+        # seconds of work; a later rerun of the day just completes the bars.
+        label="com.sma.ingest.intraday",
+        days=_WEEKDAYS,
+        fire_time_et=time(15, 41),
+        wake_lead_minutes=5,
+        deadline_offset_minutes=60,
+        depends_on=(),
+        requires_writer_lock=True,
+        waivers=frozenset(),
+        # Deadline 16:41; kickable until 18:11, clear of the 18:30 ingest's
+        # writer lock. In practice the next watchdog checkpoint (19:00) is past
+        # that, so a missed run pages rather than being kicked.
+        late_kick_max_hours=1.5,
+    ),
+    JobSchedule(
+        # Midday session: window 10:30-11:00 ET (live.sessions.midday.window).
+        label="com.sma.live.session.midday",
+        days=_WEEKDAYS,
+        fire_time_et=time(10, 35),
+        wake_lead_minutes=5,
+        deadline_offset_minutes=25,
+        depends_on=(),
+        requires_writer_lock=True,
+        waivers=frozenset(),
+        # Never late-kicked: outside its window the job only skips, so a kick
+        # buys nothing. A miss (no sentinel) pages once it is past deadline.
+        late_kick_max_hours=0.0,
+    ),
+    JobSchedule(
+        # Close session: window 15:40-15:55 ET (live.sessions.close.window).
+        label="com.sma.live.session.close",
+        days=_WEEKDAYS,
+        fire_time_et=time(15, 45),
+        wake_lead_minutes=5,
+        deadline_offset_minutes=10,
+        depends_on=(),
+        requires_writer_lock=True,
+        waivers=frozenset(),
+        late_kick_max_hours=0.0,
     ),
 )
 
 
 def get(label: str) -> JobSchedule:
-    for j in SCHEDULE:
+    for j in (*SCHEDULE, *OPTIONAL_SCHEDULE):
         if j.label == label:
             return j
     raise KeyError(f"unknown job label: {label}")

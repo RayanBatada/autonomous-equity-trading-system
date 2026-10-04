@@ -8,6 +8,7 @@ writer_lock; source='yfinance_hist'. Survivorship caveat: names that didn't
 trade in 2018-2022 simply return no rows (logged), which is correct.
 """
 import duckdb
+import pandas as pd
 import yfinance as yf
 
 from sma.ingest.universe import load_universe
@@ -29,8 +30,12 @@ for t in universe:
     if sub.empty:
         missing.append(t); continue
     for dt, r in sub.iterrows():
+        # Close is already NaN-guarded by dropna(subset=["Close"]) above; Adj
+        # Close alone can still be NaN -- store NULL, not NaN (2026-09-18
+        # incident audit).
+        adj_close = None if pd.isna(r["Adj Close"]) else float(r["Adj Close"])
         rows.append((t, dt.date(), float(r["Open"]), float(r["High"]), float(r["Low"]),
-                     float(r["Close"]), float(r["Adj Close"]), int(r["Volume"]), "yfinance_hist"))
+                     float(r["Close"]), adj_close, int(r["Volume"]), "yfinance_hist"))
 print(f"rows={len(rows)} | no pre-2023 data: {len(missing)} ({missing[:15]})")
 if rows:
     with writer_lock(label="backfill-2018"):

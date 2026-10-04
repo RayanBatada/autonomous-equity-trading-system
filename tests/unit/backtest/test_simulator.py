@@ -587,3 +587,317 @@ def test_rotation_buy_funded_by_force_sell_under_cash_floor():
     assert any(tk == "BBB" and a in ("buy",) for (_, tk, a) in actions), (
         f"BBB rotation buy was blocked by the cash floor (sim/live parity); trades={actions}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Price-based exits (trailing stop + take-profit) — 2026-07-01.
+# All three exits default OFF; these assert they fire correctly when enabled
+# and stay inert at their neutral defaults.
+# ---------------------------------------------------------------------------
+_NO_SLIP = SlippageModel(base_bps=0.0, illiquidity_penalty_bps=0.0)
+
+
+def _keep_plan(ticker: str, days: list[date], weight: float = 0.5) -> "FixedDecisionStrategy":
+    """Strategy that keeps `ticker` every day (isolates exits from force-sell)."""
+    return FixedDecisionStrategy(plan={d: [(ticker, weight)] for d in days})
+
+
+def test_trailing_stop_fires_on_peak_then_drop():
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3, 4)]
+    # buy fills at 7/2 open (100); peak rises to 120 on 7/3; 7/4 opens at 100,
+    # which is >10% below the 120 peak → trailing stop fires.
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[2], 120.0, 120.0, 120.0, 50_000_000),
+        ("AAA", days[3], 100.0, 100.0, 100.0, 50_000_000),
+    ])
+    rails = RiskRails(
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        take_profit_pct=0.0, trailing_stop_pct=0.10, cash_floor_pct=0.0,
+        max_drawdown_pct=1.0, min_hold_days=0,
+    )
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[3], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    actions = [(t["ticker"], t["action"]) for t in result.trades]
+    assert ("AAA", "trailing_stop") in actions, f"trailing stop never fired; {actions}"
+
+
+def test_trailing_stop_does_not_fire_on_steady_climb():
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3, 4, 5)]
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[2], 110.0, 110.0, 110.0, 50_000_000),
+        ("AAA", days[3], 120.0, 120.0, 120.0, 50_000_000),
+        ("AAA", days[4], 130.0, 130.0, 130.0, 50_000_000),
+    ])
+    rails = RiskRails(
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        take_profit_pct=0.0, trailing_stop_pct=0.10, cash_floor_pct=0.0,
+        max_drawdown_pct=1.0, min_hold_days=0,
+    )
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[4], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    actions = [t["action"] for t in result.trades]
+    assert "trailing_stop" not in actions, f"trailing stop fired on a monotone climb; {actions}"
+
+
+def test_take_profit_fires_at_threshold():
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3)]
+    # entry 100 on 7/2; 7/3 opens at 125 (+25%) >= +20% take-profit → fire.
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[2], 125.0, 125.0, 125.0, 50_000_000),
+    ])
+    rails = RiskRails(
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        take_profit_pct=0.20, trailing_stop_pct=0.0, cash_floor_pct=0.0,
+        max_drawdown_pct=1.0, min_hold_days=0,
+    )
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[2], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    actions = [(t["ticker"], t["action"]) for t in result.trades]
+    assert ("AAA", "take_profit") in actions, f"take-profit never fired; {actions}"
+
+
+def test_take_profit_does_not_fire_below_threshold():
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3)]
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[2], 115.0, 115.0, 115.0, 50_000_000),  # +15% < +20%
+    ])
+    rails = RiskRails(
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        take_profit_pct=0.20, trailing_stop_pct=0.0, cash_floor_pct=0.0,
+        max_drawdown_pct=1.0, min_hold_days=0,
+    )
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[2], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    actions = [t["action"] for t in result.trades]
+    assert "take_profit" not in actions, f"take-profit fired below threshold; {actions}"
+
+
+def test_new_price_exits_are_noops_at_default():
+    """Peak-then-crash path: the NEW knobs (trailing_stop_pct, take_profit_pct)
+    default to 0 and must stay inert. The legacy fixed stop_loss_pct is set to 0
+    here too so this isolates the new capability (its own default is exercised
+    elsewhere)."""
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3, 4)]
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[2], 150.0, 150.0, 150.0, 50_000_000),
+        ("AAA", days[3], 60.0, 60.0, 60.0, 50_000_000),   # -60% from peak
+    ])
+    rails = RiskRails(  # new exits at their default 0; legacy fixed stop off too
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        cash_floor_pct=0.0, max_drawdown_pct=1.0, min_hold_days=0,
+    )
+    assert rails.trailing_stop_pct == 0.0 and rails.take_profit_pct == 0.0
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[3], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    actions = {t["action"] for t in result.trades}
+    assert actions.isdisjoint({"trailing_stop", "take_profit"}), (
+        f"a NEW price exit fired at its default 0; {actions}"
+    )
+
+
+def test_trailing_stop_exit_applies_slippage():
+    """A trailing-stop exit is a market sell — it incurs sell slippage."""
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3, 4)]
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[2], 120.0, 120.0, 120.0, 50_000_000),
+        ("AAA", days[3], 100.0, 100.0, 100.0, 50_000_000),
+    ])
+    rails = RiskRails(
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        trailing_stop_pct=0.10, cash_floor_pct=0.0, max_drawdown_pct=1.0,
+        min_hold_days=0,
+    )
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[3], initial_cash=100_000.0,
+        slippage_model=SlippageModel(base_bps=100.0, illiquidity_penalty_bps=0.0),
+        rails=rails,
+    )
+    ts = [t for t in result.trades if t["action"] == "trailing_stop"]
+    assert len(ts) == 1
+    assert ts[0]["price"] < 100.0  # sell slippage pushes the exit below the open
+
+
+def test_price_exit_not_re_bought_same_day_but_allowed_later():
+    """Bug 1: a Step-0 price exit at the open must NOT be undone by yesterday's
+    still-standing target re-buying the SAME ticker at the SAME open (a no-op
+    round-trip that made take-profit/trailing backtests meaningless). The name
+    stays flat that day and may be re-bought on a LATER day if still wanted."""
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3, 4)]
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),  # buy fills @100
+        ("AAA", days[2], 130.0, 130.0, 130.0, 50_000_000),  # +30% → take-profit
+        ("AAA", days[3], 100.0, 100.0, 100.0, 50_000_000),  # re-entry allowed
+    ])
+    rails = RiskRails(
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        take_profit_pct=0.20, trailing_stop_pct=0.0, cash_floor_pct=0.0,
+        max_drawdown_pct=1.0, min_hold_days=0, rebalance_dead_zone_pct=0.0,
+    )
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[3], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    by_day: dict = {}
+    for t in result.trades:
+        by_day.setdefault(t["date"], []).append((t["action"], t["ticker"]))
+    # 7/3: exactly the take-profit sell — and NO same-day re-buy (position flat).
+    assert ("take_profit", "AAA") in by_day.get(days[2], [])
+    assert ("buy", "AAA") not in by_day.get(days[2], []), (
+        f"AAA was re-bought the same day it took profit; {by_day.get(days[2])}"
+    )
+    # 7/4: re-entry on a LATER day is allowed (model still wants it).
+    assert ("buy", "AAA") in by_day.get(days[3], []), (
+        f"AAA was never re-entered on a later day; {by_day.get(days[3])}"
+    )
+
+
+def test_price_exit_reentry_guard_is_inert_at_default():
+    """At the default take_profit/trailing/stop knobs (0.0) NO ticker is exited in
+    Step 0, so the same-day re-entry guard never engages: AAA enters once and is
+    held — byte-identical to the pre-fix baseline (nothing is ever skipped)."""
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3, 4)]
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[2], 130.0, 130.0, 130.0, 50_000_000),
+        ("AAA", days[3], 100.0, 100.0, 100.0, 50_000_000),
+    ])
+    rails = RiskRails(  # all price exits at their default 0
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        cash_floor_pct=0.0, max_drawdown_pct=1.0, min_hold_days=0,
+    )
+    assert rails.take_profit_pct == 0.0 and rails.trailing_stop_pct == 0.0
+    result = simulate(
+        strategy=_keep_plan("AAA", days), universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[3], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    actions = {t["action"] for t in result.trades}
+    assert actions.isdisjoint({"take_profit", "trailing_stop", "stop_loss"})
+    buys = [t for t in result.trades if t["action"] == "buy" and t["ticker"] == "AAA"]
+    assert buys and buys[0]["date"] == days[1], (
+        f"AAA should enter once on 7/2 with no exit-driven churn; {result.trades}"
+    )
+
+
+def test_trailing_stop_peak_survives_top_up():
+    """Bug 2 (sim reference): adding to a winner KEEPS the older post-entry peak,
+    so a later rollover still trips the trailing stop. This is the peak semantic
+    live must match — the earliest buy of the continuous holding, not the top-up
+    date. Entry @100 (7/2), peak 200 (7/2 close), top-up @190 (7/3), then 175
+    (7/4) which is >10% below the 200 peak → trailing fires."""
+    from sma.risk.rails import RiskRails
+    days = [date(2025, 7, d) for d in (1, 2, 3, 4)]
+    prices = _build_price_df([
+        ("AAA", days[0], 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", days[1], 100.0, 200.0, 200.0, 50_000_000),  # entry @100; peak→200
+        ("AAA", days[2], 190.0, 190.0, 190.0, 50_000_000),  # top-up @190; peak kept 200
+        ("AAA", days[3], 175.0, 175.0, 175.0, 50_000_000),  # 175 <= 200*0.9 → fire
+    ])
+    strat = FixedDecisionStrategy(plan={
+        days[0]: [("AAA", 0.4)],
+        days[1]: [("AAA", 0.6)],   # raise the target → averages up on 7/3
+        days[2]: [("AAA", 0.6)],
+    })
+    rails = RiskRails(
+        max_position_pct=0.9, max_sector_pct=0.95, stop_loss_pct=0.0,
+        take_profit_pct=0.0, trailing_stop_pct=0.10, cash_floor_pct=0.0,
+        max_drawdown_pct=1.0, min_hold_days=0, rebalance_dead_zone_pct=0.0,
+    )
+    result = simulate(
+        strategy=strat, universe=["AAA"], prices=prices,
+        sector_map={"AAA": "tech"}, window_name="train",
+        start_date=days[0], end_date=days[3], initial_cash=100_000.0,
+        slippage_model=_NO_SLIP, rails=rails,
+    )
+    topups = [t for t in result.trades if t["action"] == "buy" and t["date"] == days[2]]
+    assert topups, f"expected a top-up buy on 7/3; trades={result.trades}"
+    actions = [(t["ticker"], t["action"]) for t in result.trades]
+    assert ("AAA", "trailing_stop") in actions, (
+        f"trailing stop did not fire after top-up (peak wrongly reset?); {result.trades}"
+    )
+
+
+def test_extra_cash_floor_by_date_blocks_buys_on_flagged_dates():
+    """The dispersion de-risk seam (research 2026-07-20): an optional per-date
+    extra cash floor. A date with floor=1.0 forces all-cash — the buy must be
+    rejected that day and go through on an unflagged day. None = inert."""
+    from sma.risk.rails import RiskRails
+    prices = _build_price_df([
+        ("AAA", "2025-07-01", 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", "2025-07-02", 100.0, 100.0, 100.0, 50_000_000),
+        ("AAA", "2025-07-03", 100.0, 100.0, 100.0, 50_000_000),
+    ])
+    strat = FixedDecisionStrategy(plan={
+        date(2025, 7, 1): [("AAA", 0.5)],
+        date(2025, 7, 2): [("AAA", 0.5)],
+    })
+    rails = RiskRails(
+        max_position_pct=0.6, max_sector_pct=0.9, stop_loss_pct=0.0,
+        cash_floor_pct=0.0, max_drawdown_pct=1.0,
+    )
+    common = dict(
+        strategy=strat, universe=["AAA"], prices=prices,
+        sector_map={"AAA": "Technology"}, window_name="train",
+        start_date=date(2025, 7, 1), end_date=date(2025, 7, 3),
+        initial_cash=100_000.0,
+        slippage_model=SlippageModel(base_bps=0.0, illiquidity_penalty_bps=0.0),
+        rails=rails,
+    )
+    # Flagged on the day the 7/01 decision executes (fills 7/02 open): no buy.
+    r_on = simulate(**common, extra_cash_floor_by_date={date(2025, 7, 2): 1.0})
+    buys_on = [t for t in r_on.trades if t["action"] == "buy"
+               and t["date"] == date(2025, 7, 2)]
+    assert buys_on == [], f"buy executed through a 100% floor: {r_on.trades}"
+
+    # Same sim without the floor: the buy happens (proves the flag caused it).
+    r_off = simulate(**common)
+    buys_off = [t for t in r_off.trades if t["action"] == "buy"
+                and t["date"] == date(2025, 7, 2)]
+    assert buys_off, "control: buy should execute without the extra floor"

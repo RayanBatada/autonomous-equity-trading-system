@@ -8,6 +8,14 @@ ingest:
     max: 3
     base_delay: 1.0
     jitter: 0.5
+  # Cumulative retry-sleep cap per source run. Ingest holds the global writer
+  # lock; without this, a 429 storm over the universe could sleep for hours and
+  # starve predict/decide. Spent budget => skip the rate-limited ticker.
+  retry_sleep_budget_s: 180
+  # no_split_inconsistency quality check: page (degraded, non-blocking) when a
+  # ticker's yfinance and alpaca daily returns differ by more than this over
+  # the trailing 400 sessions. Fix with `python -m sma.ingest repair-splits`.
+  split_inconsistency_threshold: 0.20
   circuit_breaker:
     failures_to_open: 5
     cooldown_minutes: 60
@@ -36,9 +44,120 @@ agents:
     price_move_pct: 0.05
     material_filing_types: ['8-K', '10-K', '10-Q']
 
+notify:
+  # 2026-08-31: nightly ntfy push of tonight's SUBMITTED orders (target
+  # weights, not share counts) so Rayan can manually mirror them on his own
+  # account. Never touches trading — pure side channel read after decide's
+  # orders are already submitted. true = send (default); false = silence
+  # the push without touching anything else.
+  trade_pushes: true
+
 live:
   alpaca_paper_endpoint: https://paper-api.alpaca.markets
+  alpaca_live_endpoint: https://api.alpaca.markets
   use_theses: true                  # set per test-window gate result
+
+  # ---------------------------------------------------------------- sizing --
+  # 2026-08-27 money-path scale audit. Every value below is the NO-OP that
+  # reproduces the pre-audit behaviour exactly; the capability ships off, as
+  # with every other rail in this file.
+  #
+  # What the audit found. The real 2026-08-27 decide output (14 raw picks, 9
+  # after rails) re-translated against a fresh book at each equity:
+  #
+  #   equity        names bought   gross deployed   worst order / 20d ADV
+  #   $50                0 / 9          0.0%        --
+  #   $500               3 / 9         20.6%        0.0001%
+  #   $10,000            8 / 9         61.7%        0.0013%
+  #   $25,000            9 / 9         70.5%        0.0033%
+  #   $100,000           9 / 9         76.6%        0.0134%
+  #   $1,000,000         9 / 9         77.1%        0.135%
+  #   $10,000,000        9 / 9         77.1%        1.347%
+  #
+  # Target gross was 77.1% at EVERY scale, so everything missing below ~$25k is
+  # share rounding, not strategy: floor(weight * equity / price) is 0 whenever
+  # the price exceeds the slot. At $10k that killed LLY ($1,176/share vs an
+  # $835 slot). At $50 it killed all nine.
+  sizing:
+    # Fractional quantities. false = today's whole-share floor().
+    #
+    # Alpaca supports fractional qty ONLY on time_in_force=DAY (market, limit,
+    # stop, stop-limit) — GTC/IOC/FOK/OPG/CLS are all rejected. This bot already
+    # submits DAY market orders (OPG was retired 2026-06-08 after it expired
+    # unfilled in paper), so it is already on the one compatible path.
+    # alpaca_client._assert_fractional_is_day enforces it locally, because
+    # alpaca-py does NOT validate the combination and would only fail at the
+    # broker — at 18:35, taking the whole batch with it.
+    #
+    # NOT YET VERIFIED AGAINST A LIVE ORDER: Alpaca's fractional-trading page
+    # states fractional shares "can only be bought or sold with market orders
+    # during normal market hours", while DAY orders submitted after the close
+    # are documented as queueing to the next session. This bot submits at 18:35.
+    # Whether a fractional DAY market order submitted in the evening QUEUES or
+    # is REJECTED is not answerable from the docs. Test it with one order in
+    # paper before enabling — see docs/REAL_MONEY_CHECKLIST.md step 4.
+    fractional_shares: false
+
+    # Decimal places a fractional qty is TRUNCATED to. Alpaca accepts up to 9.
+    # Truncation, never rounding up: rounding up buys marginally more than the
+    # cash-floor check budgeted. (Whether Alpaca truncates or rejects a 10th
+    # decimal is undocumented — do not find out in production.)
+    fractional_precision: 9
+
+    # Minimum dollar notional per order; 0.0 = off (today's behaviour).
+    # Alpaca enforces a $1 minimum on BUY entry orders. At $50 equity with k=15
+    # the smallest tilted slot is ~$2, so $1 leaves every slot orderable — but
+    # a $50 account that drifts down, or a larger k, will start generating
+    # sub-$1 slots that the broker rejects one by one. Set this to 1.0 whenever
+    # fractional_shares is true. Full exits are NEVER dropped by this rail: a
+    # $0.40 dust position must always stay sellable, and Alpaca's own
+    # close-position path (AlpacaClient.close_position) has no minimum.
+    min_order_notional: 0.0
+
+    # Cap one order at this fraction of the name's 20-day average daily DOLLAR
+    # volume. 0.0 = off. The trimmed remainder is not queued anywhere —
+    # tomorrow's decide recomputes the delta from the larger position and takes
+    # the next slice, at a fresh price against a fresh signal.
+    #
+    # Why this is OFF rather than 0.02. Across all 666 orders this bot has ever
+    # placed, the largest was 0.0197% of the name's ADV — 100x under a 2% cap,
+    # so 2% is a no-op on everything that has actually traded. It is NOT
+    # provably a no-op going forward: NANC (politician-flow thematic ETF, in the
+    # universe since 2026-05-09) trades ~$0.4M/day, and a 10% slot at the
+    # current ~$120k equity is ~3% of that — over a 2% cap. NANC has never been
+    # picked. So enabling this cannot be called bit-identical, and the house
+    # rule is that a rail ships off until there is a reason to flip it.
+    # RECOMMENDED: 0.02 at $1M+, and worth flipping on at the current size
+    # purely as NANC insurance (see log.md 2026-08-27).
+    max_participation_of_adv: 0.02
+    adv_lookback_days: 20
+
+  # ------------------------------------------------------------ real money --
+  # Gates between this bot and an actual brokerage account. Reaching
+  # api.alpaca.markets needs THREE independent affirmative facts, so no single
+  # typo, merge or copied config can route a real order.
+  #
+  # Account facts verified 2026-08-27 (citations in docs/REAL_MONEY_CHECKLIST.md):
+  #   * Alpaca opens NO cash accounts — all accounts are margin. Under $2,000
+  #     equity it is a LIMITED margin account: 1x buying power, no shorting, but
+  #     trading on unsettled funds IS allowed, so a good-faith violation cannot
+  #     occur. (Alpaca publishes no GFV policy at all.)
+  #   * FINRA retired the pattern-day-trader rule outright on 2026-06-04
+  #     (Reg Notice 26-10): no day-trade counting, no $25,000 minimum. Moot here
+  #     regardless — rails.min_hold_days = 7 makes a same-day round trip
+  #     impossible.
+  #   * Real accounts pay SEC Section 31 ($20.60/$1M, sells only), FINRA TAF
+  #     ($0.000195/share, $9.79 cap, sells only) and FINRA CAT ($0.000003/share,
+  #     both sides). Paper pays none of them. A $10,000 sell costs ~$0.25.
+  real_money:
+    enabled: false
+    real_money_ack: false           # a human must set this deliberately
+    max_real_equity: 1000.0         # refuse to trade real money above this
+    dry_run: false                  # log would-be orders, submit nothing
+    fees:                           # 0 = paper. Real 2026 rates in the comment
+      sec_fee_per_million: 0.0      #   above; sma.backtest.fees has them as
+      finra_taf_per_share: 0.0      #   constants (FeeSchedule.real_money_2026)
+      finra_taf_max_per_trade: 0.0
   rails:
     # 2026-06-02: REVERTED to 0.0 (disabled). The 6/01 re-enable to 0.08 rested
     # on a backtest with TWO bugs (fixed in 1297e68): (a) stop_loss_pct=0.0 fired
@@ -50,7 +169,38 @@ live:
     # The 8% stop whipsaws out of positions that recover; force-sell already
     # handles top-K exits. Lesson: never tune live on an unvalidated backtest.
     stop_loss_pct: 0.0
+    # 2026-07-01: SMARTER price exits (trailing stop from the post-entry peak +
+    # take-profit above entry) — capability shipped, tested, live-mirrored in
+    # stop_loss_sweep, but LEFT OFF. Both windows, baseline vs grid (k15/hr30/
+    # sn1.0/mh7, WF-boundary models for VAL; STALE-2025-11 surface for most of
+    # TEST — training a 2026 walk-forward was infeasible, so TEST is a weaker leg):
+    #        variant         VAL sharpe/ret/maxDD        TEST sharpe/ret/maxDD
+    #   baseline            1.336 / 16.8% / -10.8%     2.043 / 34.1% / -10.6%
+    #   trail 0.15          1.367 / 17.0% /  -9.1%     1.794 / 27.5% /  -8.7%  (TEST worse)
+    #   take 0.20           1.387 / 16.9% /  -7.4%     2.193 / 36.2% / -10.7%
+    #   take 0.30           1.630 / 20.7% /  -9.2%     2.032 / 33.3% / -11.6%  (TEST worse)
+    #   take 0.50           1.443 / 18.1% / -10.5%     2.095 / 35.0% / -10.6%
+    #   trail0.15+take0.30  0.854 / 10.7% / -10.7%     2.292 / 37.2% /  -9.3%  (VAL worse)
+    # Reading: classic overfitting instability — the VAL winners (trail 0.15,
+    # take 0.30) LOSE on TEST, and the VAL-worst combo WINS on TEST; thresholds
+    # are non-monotonic. Only take-profit is ~neutral-to-positive on both, but its
+    # TEST edge is within noise (all take levels cluster at baseline ~2.0) and the
+    # TEST leg is on a stale model surface — not a trustworthy validated win. Per
+    # the ironclad rule (never enable live on an unvalidated backtest; do not
+    # degrade on hope), both stay 0. Closest future candidate = take_profit_pct
+    # 0.50 (beat/matched both windows, barely perturbs the book) — re-gate it once
+    # real 2026 walk-forward boundary models exist.
+    trailing_stop_pct: 0.0
+    take_profit_pct: 0.0
     cash_floor_pct: 0.05
+    # 2026-07-01: live-only safety buffer. translate() funds same-day rotation
+    # buys against sell proceeds ESTIMATED at the prior close, but those sells
+    # fill near the (usually lower) open — funding buys against the full estimate
+    # can commit cash we don't actually realize (dangerous with real money). A
+    # 3% haircut keeps a buffer. Not a performance knob: it only ever makes live
+    # sizing MORE conservative, so it needs no backtest (the sim already prices
+    # sells at the realistic slipped fill).
+    sell_proceeds_haircut: 0.97
     # 2026-05-26: 0.25 → 0.35 to unblock cash deployment. Diagnosed
     # against the live 5/25 top-10 predictions: 8 of 10 were
     # Information Technology (MRVL, CRWD, PANW, ARM, ON, ORCL, AVGO,
@@ -93,6 +243,18 @@ live:
     k: 15
     hold_rank: 30
     sector_neutralize: 1.0
+    # 2026-07-01: entry conviction floor (only buy new names whose RAW predicted
+    # 30d return clears the bar; weak days hold cash). Capability shipped + tested
+    # but LEFT OFF (null). Backtest (same grid as rails price-exits above):
+    #        floor    VAL sharpe/ret/maxDD        TEST sharpe/ret/maxDD
+    #   0.06        1.222 / 15.0% /  -8.7%     1.977 / 32.7% / -10.5%
+    #   0.08        0.854 / 10.6% /  -6.3%     1.778 / 29.0% / -11.8%
+    #   0.10        1.843 / 20.2% /  -5.9%     1.012 / 15.1% / -13.3%
+    # The floor is NON-MONOTONIC on VAL (0.06<0.08? no: 1.22>0.85<1.84) and the
+    # VAL star 0.10 COLLAPSES on TEST (sharpe 1.01 vs 2.04 baseline; return
+    # HALVED 15% vs 34%). Pure overfit — the model's raw scores sit so high (top-15
+    # median ~0.10-0.15) that any floor that bites is cutting on noise. Left OFF.
+    min_score: null
   decide:
     ingest_completion_max_retries: 20
     ingest_completion_retry_seconds: 60
@@ -101,3 +263,97 @@ live:
     partial_fill_alert_threshold_pct: 0.90
     catastrophic_loss_alert_pct: 0.10
     catastrophic_loss_abort_pct: 0.30
+    # 2026-07-30: catastrophe insurance recommended by the money-path review.
+    # Second abort check alongside catastrophic_loss_abort_pct above: that one
+    # only catches a single bad day vs yesterday's snapshot (worst real day so
+    # far: -5.1%) and is unreachable by a slow bleed spread across many
+    # smaller days — peak-to-trough drawdown has already hit -17.6% without
+    # tripping it. This compares today's equity to the running (garbage-
+    # filtered) equity peak instead of yesterday's snapshot. Explicitly
+    # approved new field — the existing values above are still NOT to be
+    # changed without a fresh validated backtest (do-not-touch rule).
+    catastrophic_peak_drawdown_abort_pct: 0.25
+    # 2026-09-04: trade-push accuracy check tolerance (relative, not a flat
+    # fraction) -- see src/sma/config.py's LiveDrift.trade_push_pct_tolerance_pct.
+    trade_push_pct_tolerance_pct: 0.20
+
+  # 09:25 ET pre-open guard: halt the day + page if the live broker book has lost
+  # >= min_missing_fraction of the positions our ledger holds (incident 2026-07-07:
+  # Alpaca wiped all paper positions overnight; the open then traded on the empty
+  # book). Cancels the evening's queued orders before the 09:30 open.
+  preopen_guard:
+    enabled: true
+    min_missing_fraction: 0.5
+    min_ledger_positions: 2
+    equity_crash_fraction: 0.3
+
+  # ------------------------------------------------ intraday sessions (off) --
+  # 2026-09-26 (strategy-expansion.md section 3). `python -m sma.live session
+  # --name midday|close` trades data/state/session_targets-<name>-<asof>.json
+  # with marketable limits. Both sessions ship disabled AND their launchd jobs
+  # ship unloaded; see ops/launchd/README.md "Intraday sessions" to enable.
+  sessions:
+    midday: {enabled: false, window: "10:30-11:00"}
+    close: {enabled: false, window: "15:40-15:55"}
+  execution:
+    limit_offset_bps: 10          # ask+10bp buy / bid-10bp sell, DAY TIF
+    sweep_after_minutes: 5        # cancel resting limits after this long
+    reprice_once: true            # first sweep re-prices once at a fresh quote
+    fallback: market              # market | leave, after the last limit attempt
+
+# 1-minute IEX bars (python -m sma.ingest intraday). Job ships unloaded.
+intraday:
+  tickers: [SPY, XLK, XLF, XLV, XLE, XLY, XLP, XLI, XLB, XLU, XLRE, XLC]
+  include_held: true
+
+# Multi-strategy sleeves (sma.strategies). Weights inside a sleeve are fractions
+# of ITS capital; live sleeves net into one book that runs through the same
+# rails. mode: shadow = proposed + persisted + scored, never ordered. Live
+# fractions must sum <= 1.0. This default is the incumbent alone, unchanged.
+strategies:
+  sleeves:
+    - name: xgb_momentum
+      capital_fraction: 1.0
+      mode: live
+      enabled: true
+
+model:
+  # Seed ensemble: N models identical except random_state, scored as the mean
+  # of their predictions (the ensemble-rank study's PRIMARY combination rule,
+  # PREREGISTRATION §2.2). 10 is the study's adopted arm B_ens, verdict
+  # ADOPT-CANDIDATE-VARIANCE (2026-08-21). Read what that verdict says before
+  # changing this:
+  #   - it did NOT raise mean rank-IC (paired per-date delta +0.0009, Newey-West
+  #     t 1.14, under the pre-registered bar of delta>0.0023 and |t|>1.96), so
+  #     this is not a "the model predicts better" change;
+  #   - it DID cut the seed lottery: variance of mean IC across sub-ensembles
+  #     fell to 0.12-0.17x the single-seed variance, top-15 selection no worse
+  #     (+0.0015). The weekly retrain re-rolls the seed every Monday, so that
+  #     variance is a real recurring cost this removes.
+  # Cost: 10x the FIT time only (CV ~45s -> ~8min); the training-set build —
+  # historically the bulk of the retrain, ~7 min since 2026-08-27 — happens
+  # once and is shared, whatever the seed count.
+  # Set to 1 to restore the exact single-model behaviour that trained every
+  # artifact before 2026-08-24.
+  ensemble_seeds: 10
+
+  # Processes the per-asof feature build fans out over. The asof axis is
+  # embarrassingly parallel — no asof reads another asof's result — and output
+  # is BIT-IDENTICAL at any worker count, proven against the serial path on a
+  # real prod-DB slice (X, y and asof_dates, with the PIT membership map and
+  # demeaned labels).
+  #
+  # It was 65-80 min of every weekly retrain when this knob shipped. Measured
+  # since, at the production ~2,170 asofs: ~27 min at 4 workers after 00baa24,
+  # ~7.3 min after 2026-08-27 hoisted the per-(ticker, asof) price truncation
+  # out of the ~22 feature functions. Still the largest single block of the
+  # retrain, and still the dominant cost of every walk-forward study (the
+  # label-horizon study ran 339 boundaries).
+  #
+  # COMMENTED OUT = auto: min(4, cpu_count - 1), which is 4 on this 10-core Mac.
+  # Uncomment and set a number to pin it; 1 restores the exact serial path (no
+  # pool at all). Each worker holds its own copy of the price and news frames
+  # (~+90 MB RSS per worker at production scale), which is why the auto-default
+  # caps at 4 rather than taking every core — the box also serves the dashboard
+  # and runs the evening trading jobs.
+  # feature_workers: 4

@@ -1,14 +1,18 @@
 """Tests for live.reconcile.reconcile."""
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, time
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
 
 from sma.ingest.store import Store
 from sma.live.alpaca_client import AlpacaClient
 from sma.live.reconcile import reconcile
+from sma.live.trade_push import record_trade_push
+
+ET = ZoneInfo("America/New_York")
 
 
 def _make_store(tmp_path):
@@ -112,7 +116,23 @@ def _alpaca_with_filled_orders(orders_data, equity=100_000.0, position_count=5,
     ancient_session.date = date(1970, 1, 1)
     tc.get_calendar.return_value = [ancient_session]
 
-    return AlpacaClient(trading_client=tc), tc
+    alpaca = AlpacaClient(trading_client=tc)
+    # Default the pre-close snapshot guard (_pre_close_skip_reason) to "already
+    # closed", keyed off whatever day is asked about, so tests that don't care
+    # about session timing behave exactly as before that guard existed. This is
+    # mocked directly on the AlpacaClient instance rather than via tc.get_calendar
+    # so it doesn't collide with the ancient-session / calendar-failure tricks
+    # above, which are answering an unrelated question (next_session_date).
+    # Tests exercising the guard itself override alpaca.session_window after
+    # construction.
+    alpaca.session_window = MagicMock(
+        side_effect=lambda *, day: (
+            datetime.combine(day, time(9, 30, tzinfo=ET)),
+            datetime.combine(day, time(0, 0, tzinfo=ET)),
+        )
+    )
+
+    return alpaca, tc
 
 
 def test_reconcile_inserts_paper_fills_with_commission_and_fees(tmp_path):
@@ -474,6 +494,48 @@ def test_record_fills_records_partial_then_canceled(tmp_path):
     assert len(rows) == 1 and rows[0][0] == 3
 
 
+def test_reconcile_skips_ledger_drift_when_disabled(tmp_path):
+    """reconcile_cmd runs the ledger-drift check ONCE after the whole drain (not
+    per-batch), so a fill recorded in a LATER batch nets an earlier batch's
+    apparent gap instead of paging mid-drain (adversarial review 2026-07-04, also
+    the same-day stop-exit page). reconcile() must honor check_ledger_drift=False."""
+    asof = date(2026, 5, 1)
+    # Ledger will show AAPL +10 (recorded BUY) but the book is empty → a mismatch.
+    store_on = Store(path=str(tmp_path / "on.duckdb")).connect()
+    _seed_intended(store_on, asof=asof, ticker="AAPL", target_shares=10, alpaca_order_id="ord-1")
+    alpaca_on, _ = _alpaca_with_filled_orders(
+        [("ord-1", "AAPL", "BUY", 10, 200.0, "filled")], positions={})
+    res_on = reconcile(asof=asof, store=store_on, alpaca=alpaca_on, notify_fn=lambda _: None)
+    assert any(a.kind == "ledger_position_drift" for a in res_on.alerts), "control: mismatch pages"
+
+    store_off = Store(path=str(tmp_path / "off.duckdb")).connect()
+    _seed_intended(store_off, asof=asof, ticker="AAPL", target_shares=10, alpaca_order_id="ord-1")
+    alpaca_off, _ = _alpaca_with_filled_orders(
+        [("ord-1", "AAPL", "BUY", 10, 200.0, "filled")], positions={})
+    res_off = reconcile(asof=asof, store=store_off, alpaca=alpaca_off,
+                        notify_fn=lambda _: None, check_ledger_drift=False)
+    assert not any(a.kind == "ledger_position_drift" for a in res_off.alerts)
+
+
+def test_no_fill_drift_excludes_stop_canceled_decide_orders(tmp_path):
+    """A decide order the stop sweep canceled ('canceled_by_stop') is a deliberate
+    cancel, not a failed open-auction cross — it must NOT count toward the
+    buy_miss_systemic alert (#9/#10, review 2026-07-04). Two canceled buys would
+    otherwise read as 100% missed and page every reconcile."""
+    from sma.live.reconcile import _detect_no_fill_drift
+
+    store = _make_store(tmp_path)
+    asof = date(2026, 5, 1)
+    for i in range(2):
+        iid = _seed_intended(store, asof=asof, ticker=f"T{i}", side="BUY",
+                             alpaca_order_id=f"o{i}")
+        store.conn.execute(
+            "UPDATE intended_orders SET status='canceled_by_stop' "
+            "WHERE intended_order_id=?", [iid],
+        )
+    assert _detect_no_fill_drift(asof=asof, store=store) == []
+
+
 def test_record_fills_skips_unmatched_orders(tmp_path):
     """An Alpaca order with no matching intended_orders row (manual/unrelated)
     must NOT be inserted into paper_fills (contamination)."""
@@ -507,6 +569,54 @@ def test_record_fills_finds_order_submitted_on_different_day_than_asof(tmp_path)
         "SELECT ticker, filled_shares, asof_date FROM paper_fills"
     ).fetchone()
     assert row == ("AAPL", 10, asof)
+
+
+def test_reconcile_records_stop_loss_fills_not_just_decide(tmp_path):
+    """A source='stop-loss' SELL fill must be recorded in paper_fills. Before the
+    fix _record_fills filtered source='decide' only, so a price-exit sell was
+    never recorded — the trailing-stop peak reconstruction never saw the exit and
+    the ledger-drift detector fired spuriously after any stop (review 2026-07-04)."""
+    store = _make_store(tmp_path)
+    asof = date(2026, 5, 1)
+    _seed_intended(store, asof=asof, ticker="NVDA", side="SELL", target_shares=10,
+                   alpaca_order_id="ord-sl", source="stop-loss")
+    alpaca, _ = _alpaca_with_filled_orders(
+        [("ord-sl", "NVDA", "SELL", 10, 150.0, "filled")], positions={},
+    )
+    result = reconcile(asof=asof, store=store, alpaca=alpaca, notify_fn=lambda _: None)
+    assert result.fills_recorded == 1
+    rows = store.conn.execute(
+        "SELECT alpaca_order_id, ticker, side, filled_shares FROM paper_fills"
+    ).fetchall()
+    assert rows == [("ord-sl", "NVDA", "SELL", 10)]
+
+
+def test_backfill_recovers_stop_loss_order_via_source_aware_coid(tmp_path):
+    """A crash-after-accept stop-loss order (alpaca_order_id=NULL) must be
+    recovered via client_order_id(asof, ticker, 'SELL', source='stop-loss'): the
+    stop-loss coid embeds the source, so the decide-form coid would never match."""
+    from sma.live.orders import client_order_id
+
+    store = _make_store(tmp_path)
+    asof = date(2026, 5, 1)
+    _seed_intended(store, asof=asof, ticker="NVDA", side="SELL", target_shares=10,
+                   alpaca_order_id=None, source="stop-loss")
+    alpaca, tc = _alpaca_with_filled_orders(
+        [("ord-sl", "NVDA", "SELL", 10, 150.0, "filled")], positions={},
+    )
+    expected_coid = client_order_id(asof, "NVDA", "SELL", source="stop-loss")
+    recovered = MagicMock()
+    recovered.id = "ord-sl"
+    recovered.status = "filled"
+    tc.get_order_by_client_id.side_effect = (
+        lambda coid: recovered if coid == expected_coid else None
+    )
+
+    result = reconcile(asof=asof, store=store, alpaca=alpaca, notify_fn=lambda _: None)
+    assert result.fills_recorded == 1
+    assert store.conn.execute(
+        "SELECT alpaca_order_id FROM intended_orders WHERE source='stop-loss'"
+    ).fetchone()[0] == "ord-sl"
 
 
 def test_record_fills_skips_malformed_order_without_aborting_batch(tmp_path):
@@ -625,6 +735,117 @@ def test_reconcile_alerts_when_snapshot_write_fails(tmp_path, monkeypatch):
     assert any("snapshot" in m.lower() for m in notified)
 
 
+# ---- pre-close snapshot guard (2026-08-20) --------------------------------
+#
+# 2026-08-20 live bug: a launchd catch-up ran reconcile at 05:36 ET, before
+# that day's session had even opened. get_account() at that hour prices off
+# the PRIOR session's after-hours mark, so the row written under
+# asof_date=2026-08-20 was actually Wednesday-night marks ($121,930.99 vs
+# live $121,534) mislabeled as Thursday's close.
+
+
+def test_reconcile_skips_same_day_snapshot_before_session_close(tmp_path, caplog):
+    """Pre-open run: session_window says the close hasn't happened yet ->
+    write NO row at all, snapshot_written=False, and -- critically -- no
+    'snapshot_failed' alert (this is an intentional skip, not a failure).
+    Also logs one explanatory INFO line, per the fix's contract."""
+    import logging
+    caplog.set_level(logging.INFO, logger="sma.live.reconcile")
+
+    store = _make_store(tmp_path)
+    asof = date(2026, 8, 19)
+    alpaca, _ = _alpaca_with_filled_orders([], equity=121_930.99)
+    alpaca.session_window = MagicMock(return_value=(
+        datetime(2026, 8, 20, 9, 30, tzinfo=ET), datetime(2026, 8, 20, 16, 0, tzinfo=ET),
+    ))
+    now = datetime(2026, 8, 20, 5, 36, tzinfo=ET)  # pre-open catch-up
+
+    notified: list[str] = []
+    result = reconcile(asof=asof, store=store, alpaca=alpaca,
+                       notify_fn=notified.append, now=now)
+
+    assert result.snapshot_written is False
+    kinds = {a.kind for a in result.alerts}
+    assert "snapshot_failed" not in kinds, (
+        "an intentional pre-close skip must not page as a write failure"
+    )
+    assert notified == [], "a pre-close skip must not notify at all"
+    row = store.conn.execute(
+        "SELECT 1 FROM account_snapshots WHERE asof_date = ?", [date(2026, 8, 20)],
+    ).fetchone()
+    assert row is None, "no phantom row for a session that hasn't closed yet"
+    assert any(
+        "skipping account_snapshots write" in r.message for r in caplog.records
+    ), "must log one explanatory INFO line"
+
+
+def test_reconcile_writes_same_day_snapshot_after_session_close(tmp_path):
+    """The normal 16:30 ET case: session_window says the close has happened ->
+    write proceeds exactly as before this guard existed."""
+    store = _make_store(tmp_path)
+    asof = date(2026, 8, 19)
+    alpaca, _ = _alpaca_with_filled_orders([], equity=121_534.0)
+    alpaca.session_window = MagicMock(return_value=(
+        datetime(2026, 8, 20, 9, 30, tzinfo=ET), datetime(2026, 8, 20, 16, 0, tzinfo=ET),
+    ))
+    # 16:05 -- past the 16:00 close (guard passes) but before the 16:10
+    # after-hours-equity cutoff, so this stays on the plain get_account path
+    # (portfolio-history sourcing is covered by test_snapshot_equity_source.py).
+    now = datetime(2026, 8, 20, 16, 5, tzinfo=ET)
+
+    result = reconcile(asof=asof, store=store, alpaca=alpaca,
+                       notify_fn=lambda _: None, now=now)
+
+    assert result.snapshot_written is True
+    row = store.conn.execute(
+        "SELECT equity FROM account_snapshots WHERE asof_date = ?", [date(2026, 8, 20)],
+    ).fetchone()
+    assert row is not None
+    assert row[0] == 121_534.0
+
+
+def test_reconcile_writes_half_day_snapshot_after_1300_close(tmp_path):
+    """Half-days close at 13:00, not 16:00 -- a 14:00 run must write, using
+    the REAL session close from session_window rather than a hardcoded hour."""
+    store = _make_store(tmp_path)
+    asof = date(2026, 11, 25)
+    half_day = date(2026, 11, 27)  # Thanksgiving half-day
+    alpaca, _ = _alpaca_with_filled_orders([], equity=110_000.0)
+    alpaca.session_window = MagicMock(return_value=(
+        datetime(2026, 11, 27, 9, 30, tzinfo=ET), datetime(2026, 11, 27, 13, 0, tzinfo=ET),
+    ))
+    now = datetime(2026, 11, 27, 14, 0, tzinfo=ET)
+
+    result = reconcile(asof=asof, store=store, alpaca=alpaca,
+                       notify_fn=lambda _: None, now=now)
+
+    assert result.snapshot_written is True
+    row = store.conn.execute(
+        "SELECT 1 FROM account_snapshots WHERE asof_date = ?", [half_day],
+    ).fetchone()
+    assert row is not None
+
+
+def test_reconcile_skips_snapshot_on_non_session_day(tmp_path):
+    """session_window returns None (weekend/holiday) -> skip entirely, never
+    write a row for a day that was never a trading session."""
+    store = _make_store(tmp_path)
+    asof = date(2026, 8, 21)
+    saturday = date(2026, 8, 22)
+    alpaca, _ = _alpaca_with_filled_orders([], equity=100_000.0)
+    alpaca.session_window = MagicMock(return_value=None)
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=ET)
+
+    result = reconcile(asof=asof, store=store, alpaca=alpaca,
+                       notify_fn=lambda _: None, now=now)
+
+    assert result.snapshot_written is False
+    row = store.conn.execute(
+        "SELECT 1 FROM account_snapshots WHERE asof_date = ?", [saturday],
+    ).fetchone()
+    assert row is None
+
+
 # ---- ledger-vs-broker drift (2026-06-24 audit) ----------------------------
 
 
@@ -703,3 +924,203 @@ def test_reconcile_wires_ledger_drift_alert(tmp_path):
     alpaca, _ = _alpaca_with_filled_orders([], position_count=0)
     result = reconcile(asof=asof, store=store, alpaca=alpaca, notify_fn=lambda _: None)
     assert "ledger_position_drift" in {a.kind for a in result.alerts}
+
+
+def test_reconcile_fires_trade_push_mismatch_after_open(tmp_path):
+    """Push claimed 8.0% of equity for a $2,000 (2.0%-of-equity) AAPL BUY --
+    an LLY-shaped bug (claimed weight far from the order's real notional).
+    Reconcile must surface it as a trade_push_mismatch alert once the fill
+    has had a chance to book (past the next session's open auction)."""
+    eastern = ZoneInfo("America/New_York")
+
+    store = _make_store(tmp_path)
+    asof = date(2026, 4, 27)  # Mon
+    _seed_intended(store, asof=asof, ticker="AAPL", side="BUY",
+                   target_shares=10, alpaca_order_id="ord-aapl")
+    alpaca, tc = _alpaca_with_filled_orders(
+        [("ord-aapl", "AAPL", "BUY", 10, 200.0, "filled")], equity=100_000.0,
+    )
+    next_session = MagicMock()
+    next_session.date = date(2026, 4, 28)  # Tue
+    tc.get_calendar.return_value = [next_session]
+
+    record_trade_push(
+        asof=asof, title="t", message="m",
+        orders=[{
+            "ticker": "AAPL", "side": "BUY", "shares": 10,
+            "decide_price": 200.0, "order_notional": 2_000.0,
+            "order_pct_of_equity": 0.08,  # bug: real notional is 2.0%, not 8.0%
+            "full_exit": False,
+        }],
+        equity=100_000.0, delivered=True,
+    )
+
+    now_et = datetime(2026, 4, 28, 16, 30, tzinfo=eastern)
+    notified: list[str] = []
+    result = reconcile(asof=asof, store=store, alpaca=alpaca,
+                       notify_fn=notified.append, now=now_et)
+
+    kinds = [a.kind for a in result.alerts]
+    assert "trade_push_mismatch" in kinds
+    assert any("AAPL" in m for m in notified)
+
+
+def test_reconcile_silent_when_push_file_missing(tmp_path):
+    """Same setup, minus the record_trade_push call -- no trade_push_mismatch
+    alert. Best-effort check: no persisted push means nothing to verify."""
+    eastern = ZoneInfo("America/New_York")
+
+    store = _make_store(tmp_path)
+    asof = date(2026, 4, 27)
+    _seed_intended(store, asof=asof, ticker="AAPL", side="BUY",
+                   target_shares=10, alpaca_order_id="ord-aapl2")
+    alpaca, tc = _alpaca_with_filled_orders(
+        [("ord-aapl2", "AAPL", "BUY", 10, 200.0, "filled")], equity=100_000.0,
+    )
+    next_session = MagicMock()
+    next_session.date = date(2026, 4, 28)
+    tc.get_calendar.return_value = [next_session]
+
+    now_et = datetime(2026, 4, 28, 16, 30, tzinfo=eastern)
+    result = reconcile(asof=asof, store=store, alpaca=alpaca,
+                       notify_fn=lambda _: None, now=now_et)
+
+    kinds = [a.kind for a in result.alerts]
+    assert "trade_push_mismatch" not in kinds
+
+
+def test_reconcile_does_not_fall_back_to_prior_sessions_push(tmp_path):
+    """Regression lock (2026-09-11 investigation): a bug report proposed
+    verifying `asof`'s fills against the PREVIOUS trading session's push
+    instead of `asof`'s own push, on the theory that `asof` means "today"
+    rather than "the decide day being reconciled". That theory is wrong --
+    `asof` IS the decide day (see reconcile.py's module docstring), and
+    push(asof) is the SAME batch as intended_orders(asof_date=asof) by
+    construction (both written by the one decide_once(asof=asof) call).
+
+    Prove it directly: `asof`'s OWN push is deliberately wrong (LLY-shaped:
+    claims 8% of equity for a real 2%-of-equity fill), while the PRIOR
+    session has a push that would look like a clean match for these same
+    fills if it were (wrongly) the one consulted. reconcile(asof=...) must
+    still fire the mismatch -- if it silently passed, that would mean it had
+    fallen back to the prior session's push instead of asof's own."""
+    eastern = ZoneInfo("America/New_York")
+
+    store = _make_store(tmp_path)
+    asof = date(2026, 4, 27)          # decide day being reconciled
+    prior_session = date(2026, 4, 24)  # the session strictly before `asof`
+
+    _seed_intended(store, asof=asof, ticker="AAPL", side="BUY",
+                   target_shares=10, alpaca_order_id="ord-aapl-noFallback")
+    alpaca, tc = _alpaca_with_filled_orders(
+        [("ord-aapl-noFallback", "AAPL", "BUY", 10, 200.0, "filled")],
+        equity=100_000.0,
+    )
+    next_session = MagicMock()
+    next_session.date = date(2026, 4, 28)
+    tc.get_calendar.return_value = [next_session]
+
+    # The PRIOR session's push: a totally different, unrelated AAPL order
+    # sized so it reads as a clean match against `asof`'s real $2,000 fill --
+    # if the detector ever consulted this instead of asof's own push, the
+    # mismatch below would be masked.
+    record_trade_push(
+        asof=prior_session, title="t", message="m",
+        orders=[{
+            "ticker": "AAPL", "side": "BUY", "shares": 10,
+            "decide_price": 200.0, "order_notional": 2_000.0,
+            "order_pct_of_equity": 0.02,  # matches the real fill -- a decoy
+            "full_exit": False,
+        }],
+        equity=100_000.0, delivered=True,
+    )
+    # `asof`'s OWN push: the actual bug shape (claims 8%, real notional 2%).
+    record_trade_push(
+        asof=asof, title="t", message="m",
+        orders=[{
+            "ticker": "AAPL", "side": "BUY", "shares": 10,
+            "decide_price": 200.0, "order_notional": 2_000.0,
+            "order_pct_of_equity": 0.08,
+            "full_exit": False,
+        }],
+        equity=100_000.0, delivered=True,
+    )
+
+    now_et = datetime(2026, 4, 28, 16, 30, tzinfo=eastern)
+    notified: list[str] = []
+    result = reconcile(asof=asof, store=store, alpaca=alpaca,
+                       notify_fn=notified.append, now=now_et)
+
+    kinds = [a.kind for a in result.alerts]
+    assert "trade_push_mismatch" in kinds
+    assert any("AAPL" in m for m in notified)
+
+
+def test_reconcile_catch_up_two_batches_each_verify_own_push(tmp_path):
+    """Mirrors sma.live.__main__'s catch-up loop: multiple missed decide
+    batches get reconciled in the same run, one reconcile() call per asof
+    (the `reconciled_asofs` list). Each batch's push must be checked against
+    THAT batch's own fills -- session 1's deliberate mismatch must not leak
+    into session 2's clean result."""
+    eastern = ZoneInfo("America/New_York")
+
+    store = _make_store(tmp_path)
+    asof1 = date(2026, 4, 27)  # Mon -- mismatched push
+    asof2 = date(2026, 4, 28)  # Tue -- clean push
+
+    _seed_intended(store, asof=asof1, ticker="INTC", side="SELL",
+                   target_shares=20, last_price=100.32,
+                   alpaca_order_id="ord-intc-catchup")
+    _seed_intended(store, asof=asof2, ticker="PWR", side="BUY",
+                   target_shares=2, last_price=618.73,
+                   alpaca_order_id="ord-pwr-catchup")
+    alpaca, tc = _alpaca_with_filled_orders(
+        [
+            ("ord-intc-catchup", "INTC", "SELL", 20, 102.0, "filled"),
+            ("ord-pwr-catchup", "PWR", "BUY", 2, 627.24, "filled"),
+        ],
+        equity=100_000.0,
+    )
+    # Both batches' order_drift_open gates just need to be open by `now_et`
+    # below; the mock's next-session date is shared across both asof calls
+    # (AlpacaClient.next_session_date ignores which asof it was asked about
+    # here), same simplification the rest of this file's fixture uses.
+    next_session = MagicMock()
+    next_session.date = date(2026, 4, 29)
+    tc.get_calendar.return_value = [next_session]
+
+    record_trade_push(
+        asof=asof1, title="t", message="m",
+        orders=[{
+            "ticker": "INTC", "side": "SELL", "shares": 20,
+            "decide_price": 100.32, "order_notional": 2006.4,
+            "order_pct_of_equity": 0.50,  # deliberately wrong (LLY-shaped)
+            "full_exit": False,
+        }],
+        equity=100_000.0, delivered=True,
+    )
+    record_trade_push(
+        asof=asof2, title="t", message="m",
+        orders=[{
+            "ticker": "PWR", "side": "BUY", "shares": 2,
+            "decide_price": 618.73, "order_notional": 1237.46,
+            "order_pct_of_equity": 1237.46 / 100_000.0,  # accurate
+            "full_exit": False,
+        }],
+        equity=100_000.0, delivered=True,
+    )
+
+    now_et = datetime(2026, 4, 29, 16, 30, tzinfo=eastern)
+    result1 = reconcile(asof=asof1, store=store, alpaca=alpaca,
+                        notify_fn=lambda _: None, now=now_et,
+                        check_ledger_drift=False)
+    result2 = reconcile(asof=asof2, store=store, alpaca=alpaca,
+                        notify_fn=lambda _: None, now=now_et,
+                        check_ledger_drift=False)
+
+    kinds1 = [a.kind for a in result1.alerts]
+    kinds2 = [a.kind for a in result2.alerts]
+    assert "trade_push_mismatch" in kinds1
+    assert any("INTC" in a.detail for a in result1.alerts
+               if a.kind == "trade_push_mismatch")
+    assert "trade_push_mismatch" not in kinds2

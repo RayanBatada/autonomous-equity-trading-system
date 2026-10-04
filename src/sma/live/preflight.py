@@ -45,7 +45,14 @@ class IngestNotCompleteError(PreflightError):
 
 
 class UpstreamMissedDeadline(PreflightError):  # noqa: N818
-    pass
+    """An upstream job's sentinel for `asof` never landed inside decide's wait
+    window. `label` (the upstream job's launchd label, e.g.
+    "com.sma.model.predict.daily") lets the caller build an actionable
+    re-kick hint (2026-08-05 post-mortem — see sma.live.__main__.decide)."""
+
+    def __init__(self, message: str, *, label: str | None = None):
+        super().__init__(message)
+        self.label = label
 
 
 class UpstreamReadinessFailed(PreflightError):  # noqa: N818
@@ -204,7 +211,8 @@ def run_preflight(
                     )
                 raise UpstreamMissedDeadline(
                     f"{upstream_label} sentinel not ready for {asof.isoformat()} "
-                    f"(test mode): {r.explanation}"
+                    f"(test mode): {r.explanation}",
+                    label=upstream_label,
                 )
             now = _now()
             if now >= wait_until:
@@ -215,7 +223,8 @@ def run_preflight(
                     )
                 raise UpstreamMissedDeadline(
                     f"{upstream_label} sentinel not ready by deadline {wait_until}: "
-                    f"{r.explanation}"
+                    f"{r.explanation}",
+                    label=upstream_label,
                 )
             _sleep(poll_interval_s)
 

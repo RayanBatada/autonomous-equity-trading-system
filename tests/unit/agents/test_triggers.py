@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from sma.agents.triggers import TriggerConfig, tickers_needing_refresh
+from sma.agents.triggers import TriggerConfig, refresh_order, tickers_needing_refresh
 from sma.ingest.store import Store
 
 
@@ -185,3 +185,41 @@ def test_returns_sorted_list(store):
     )
     assert out == sorted(out)
     assert "AAPL" in out and "MSFT" in out and "TSLA" in out
+
+
+# ---------------------------------------------------------------------------
+# refresh_order: held names must never be starved (2026-07-29)
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_order_puts_held_names_first():
+    """Held tickers must come FIRST, ahead of event-triggered ones.
+
+    The agents run has a hard 19:58 ET deadline cutoff that stops STARTING new
+    tickers (it must release the writer lock before decide fires at 20:00). Any
+    held name sitting in the tail of the list simply never gets a thesis.
+    """
+    order = refresh_order(
+        triggered=["AAPL", "ZZZ"], held=["MU", "DKNG"], universe=["AAPL", "ZZZ", "MU", "DKNG"]
+    )
+    assert order[:2] == ["DKNG", "MU"], f"held names must lead, got {order}"
+    assert set(order) == {"AAPL", "ZZZ", "MU", "DKNG"}
+
+
+def test_refresh_order_dedupes_a_held_name_that_also_triggered():
+    """A held name that ALSO has an event trigger appears exactly once."""
+    order = refresh_order(triggered=["MU"], held=["MU"], universe=["MU", "AAPL"])
+    assert order == ["MU"]
+
+
+def test_refresh_order_drops_held_names_outside_the_universe():
+    """A position in a delisted/removed name must not be sent to the LLM."""
+    order = refresh_order(triggered=["AAPL"], held=["DELISTED"], universe=["AAPL"])
+    assert order == ["AAPL"]
+
+
+def test_refresh_order_is_deterministic():
+    """Same inputs -> same order, regardless of input ordering."""
+    a = refresh_order(triggered=["B", "A"], held=["Z", "Y"], universe=["A", "B", "Y", "Z"])
+    b = refresh_order(triggered=["A", "B"], held=["Y", "Z"], universe=["A", "B", "Y", "Z"])
+    assert a == b

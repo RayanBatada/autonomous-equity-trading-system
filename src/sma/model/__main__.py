@@ -5,13 +5,19 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import click
-import duckdb
 import pandas as pd
 from loguru import logger
 
+from sma.config import load_model_config
+from sma.db_connect import read_only_connect
 from sma.ingest.notify import notify_failure
-from sma.ingest.universe import load_universe
+from sma.ingest.universe import load_training_membership, load_universe
 from sma.locks import heavy_job_lock, writer_lock
+from sma.model.ensemble import (
+    ensemble_random_states,
+    ensemble_size,
+    seeds_are_inert,
+)
 from sma.model.loader import build_training_set
 from sma.model.persistence import (
     GATE_MAX_CV_RMSE_RATIO,
@@ -20,6 +26,7 @@ from sma.model.persistence import (
     incumbent_train_start,
     latest_model_for_date,
     passes_ic_floor,
+    prune_old_artifacts,
     save_model,
     should_promote,
     write_predictions,
@@ -35,6 +42,9 @@ from sma.sentinels import read_sentinel, write_sentinel
 DEFAULT_DB_PATH = Path("data/sma.duckdb")
 DEFAULT_MODELS_DIR = Path("models_artifacts")
 DEFAULT_UNIVERSE_PATH = Path("src/sma/universe.yaml")
+# Point-in-time membership map (survivorship fix). Sits beside universe.yaml;
+# absent file → {} → training behaves exactly as it did before it existed.
+DEFAULT_UNIVERSE_HISTORY_PATH = Path("src/sma/universe_history.yaml")
 DEFAULT_TARGET = "ret_30d_forward"
 DEFAULT_FORWARD_HORIZON = 30
 def _train_default_start() -> date:
@@ -44,6 +54,38 @@ def _train_default_start() -> date:
     import os
     v = os.environ.get("SMA_TRAIN_START")
     return date.fromisoformat(v) if v else date(2018, 1, 1)
+
+
+def _resolve_ensemble_seeds(cli_value, *, config_path="config.yaml") -> int:
+    """How many seeds this retrain trains: the --ensemble-seeds flag when
+    given, otherwise model.ensemble_seeds from config.yaml (default 10).
+
+    The scheduled plist passes no flag and runs with WorkingDirectory set to
+    the repo root, so the relative config path resolves for the 04:00 job.
+    """
+    n = cli_value if cli_value is not None else load_model_config(config_path).ensemble_seeds
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"ensemble_seeds must be an integer >= 1; got {n!r}")
+    return n
+
+
+def _resolve_feature_workers(cli_value, *, config_path="config.yaml") -> int:
+    """How many processes the per-asof feature build fans out over: the
+    --feature-workers flag when given, otherwise model.feature_workers from
+    config.yaml (default min(4, cpu_count - 1)).
+
+    Same shape and same tolerance as _resolve_ensemble_seeds: the scheduled
+    plist passes no flag and runs with WorkingDirectory at the repo root, so
+    the relative config path resolves for the 04:00 job, and an unreadable
+    config falls back to the default rather than killing the retrain.
+    """
+    n = (
+        cli_value if cli_value is not None
+        else load_model_config(config_path).feature_workers
+    )
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"feature_workers must be an integer >= 1; got {n!r}")
+    return n
 
 
 # 2026-06-16: default moved 2023 -> 2018 after the multi-regime experiment.
@@ -60,7 +102,7 @@ def _load_politician_trades(db_path: Path) -> pd.DataFrame:
     without v5 migration) or has no rows."""
     if not db_path.exists():
         return pd.DataFrame()
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = read_only_connect(db_path)  # 2026-08-05 audit: retry lock overlap w/ ingest
     try:
         df = con.execute(
             "SELECT ticker, filing_date, transaction_date, transaction_type, "
@@ -86,7 +128,7 @@ def _load_news_for_count_feature(db_path: Path) -> pd.DataFrame:
     inner training loop."""
     if not db_path.exists():
         return pd.DataFrame()
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = read_only_connect(db_path)  # 2026-08-05 audit: retry lock overlap w/ ingest
     try:
         df = con.execute(
             "SELECT ticker, CAST(published_at AS DATE) AS published_at_date "
@@ -102,15 +144,22 @@ def _load_news_for_count_feature(db_path: Path) -> pd.DataFrame:
 
 
 def _load_earnings_calendar(db_path: Path) -> pd.DataFrame:
-    """Load all (ticker, report_date) rows from `earnings` for use as the
-    days_to_next_earnings feature. Returns empty DataFrame if the table
-    doesn't exist or has no rows."""
+    """Load (ticker, report_date, eps_estimate, eps_actual) rows from
+    `earnings` for the days_to_next_earnings AND earnings_surprise_last
+    features. Returns empty DataFrame if the table doesn't exist or is empty.
+
+    The eps columns are REQUIRED: loader._compute_latest_surprises defensively
+    returns {} when they're absent, so a ticker+date-only SELECT silently
+    trained earnings_surprise_last as a constant 0.0 while predict served real
+    values — train/serve skew, live since the feature shipped (review
+    2026-07-01 HIGH)."""
     if not db_path.exists():
         return pd.DataFrame()
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = read_only_connect(db_path)  # 2026-08-05 audit: retry lock overlap w/ ingest
     try:
         df = con.execute(
-            "SELECT DISTINCT ticker, report_date FROM earnings "
+            "SELECT DISTINCT ticker, report_date, eps_estimate, eps_actual "
+            "FROM earnings "
             "WHERE ticker IS NOT NULL AND report_date IS NOT NULL "
             "ORDER BY ticker, report_date"
         ).df()
@@ -133,7 +182,7 @@ def _load_prices_for_range(
     if not db_path.exists():
         raise FileNotFoundError(f"DuckDB not found at {db_path}.")
     tickers = list(set(list(universe) + ["SPY"]))
-    con = duckdb.connect(str(db_path), read_only=True)
+    con = read_only_connect(db_path)  # 2026-08-05 audit: retry lock overlap w/ ingest
     try:
         df = con.execute(
             """
@@ -205,10 +254,14 @@ def cli():
 @click.option("--models-dir", type=click.Path(path_type=Path), default=DEFAULT_MODELS_DIR)
 @click.option("--universe-path", type=click.Path(path_type=Path), default=DEFAULT_UNIVERSE_PATH)
 @click.option(
-    "--demean-labels", is_flag=True, default=False,
+    "--demean-labels/--raw-labels", "demean_labels", default=True,
     help="Train on cross-sectionally demeaned (relative/alpha) 30d returns "
-         "instead of raw returns — a raw label lets the model learn beta "
-         "(strategy review 2026-06-11).",
+         "(the production standard since 2026-06-13) vs raw returns, which let "
+         "the model learn beta. DEFAULT IS DEMEAN: a scheduler entry that "
+         "omits the flag must train the production label type — the 2026-06-29 "
+         "incident (installed plist lost --demean-labels, silently deploying a "
+         "raw model via the label-transition promote rule) is why. Raw now "
+         "requires an explicit --raw-labels.",
 )
 @click.option(
     "--label-stride",
@@ -224,6 +277,42 @@ def cli():
     show_default=True,
     help="Model objective: regression returns or per-asof-date pairwise ranking.",
 )
+@click.option(
+    "--universe-history-path",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_UNIVERSE_HISTORY_PATH,
+    help="Point-in-time membership map. Absent file = no restriction.",
+)
+@click.option(
+    "--ensemble-seeds",
+    type=int,
+    default=None,
+    help="Train N models differing only in random_state and score their MEAN "
+         "(the 2026-08-21 ensemble-rank study's adopted B_ens arm, taken for "
+         "seed-variance reduction rather than a mean-IC gain). Omit to use "
+         "model.ensemble_seeds from config.yaml (10). 1 = the single-model "
+         "behaviour that trained every artifact before 2026-08-24. The "
+         "training set is built ONCE and shared across the N fits.",
+)
+@click.option(
+    "--feature-workers",
+    type=int,
+    default=None,
+    help="Processes to fan the per-asof feature build out over. The feature "
+         "build is 65-80 min of this job and the asof axis is embarrassingly "
+         "parallel; output is BIT-IDENTICAL at any worker count. Omit to use "
+         "model.feature_workers from config.yaml (min(4, cpu_count - 1)). "
+         "1 = the exact serial path, no pool.",
+)
+@click.option(
+    "--pit-universe/--no-pit-universe", "pit_universe", default=True,
+    help="Restrict each ticker's training rows to its point-in-time membership "
+         "window from universe_history.yaml. DEFAULT IS ON: without it the "
+         "training set treats today's April-2026 universe as having always "
+         "existed, which the breadth study measured at +0.76pp of 30d top-15 "
+         "excess overall and +2.73pp on 2023+. --no-pit-universe reproduces "
+         "the pre-2026-08-17 (survivorship-biased) training set for A/B.",
+)
 def train(
     asof,
     no_cv,
@@ -233,6 +322,10 @@ def train(
     demean_labels,
     label_stride,
     objective,
+    ensemble_seeds,
+    universe_history_path,
+    feature_workers,
+    pit_universe,
 ):
     """Train an XGBoost model up to ASOF and save it.
 
@@ -248,6 +341,46 @@ def train(
     else:
         asof_date = asof.date()
     universe = load_universe(universe_path)
+
+    n_ensemble = _resolve_ensemble_seeds(ensemble_seeds)
+    logger.info(
+        f"Seed ensemble: {n_ensemble} model(s) per fit"
+        + (" — CV gates score the ensemble MEAN (study B_ens, 2026-08-21)."
+           if n_ensemble > 1 else " — single-model (pre-2026-08-24 behaviour).")
+    )
+    n_feature_workers = _resolve_feature_workers(feature_workers)
+    logger.info(
+        f"Feature build: {n_feature_workers} worker process(es)"
+        + (" — per-asof fan-out, bit-identical to serial."
+           if n_feature_workers > 1 else " — serial (no pool).")
+    )
+
+    # Point-in-time membership (survivorship fix, activated 2026-08-17). Each
+    # ticker contributes rows only inside [added, removed). Empty map — file
+    # absent, or --no-pit-universe — restores the previous training set exactly.
+    membership: dict[str, tuple[date | None, date | None]] = {}
+    if pit_universe:
+        membership = load_training_membership(universe_history_path)
+        if membership:
+            restricted = sum(
+                1 for t in universe
+                if membership.get(t, (None, None)) != (None, None)
+            )
+            logger.info(
+                f"PIT universe ON: {len(membership)} membership intervals from "
+                f"{universe_history_path}; {restricted}/{len(universe)} "
+                f"universe tickers carry a date bound."
+            )
+        else:
+            logger.warning(
+                f"PIT universe requested but {universe_history_path} is absent "
+                "or empty — training on the full (survivorship-biased) universe."
+            )
+    else:
+        logger.warning(
+            "PIT universe OFF (--no-pit-universe): training treats today's "
+            "universe as having always existed."
+        )
 
     logger.info(f"Loading prices for {len(universe)} tickers up to {asof_date}")
     _train_start = _train_default_start()
@@ -292,6 +425,8 @@ def train(
             politician_trades=politician_trades_df,
             earnings=earnings_df,
             news=news_df,
+            membership=membership,
+            feature_workers=n_feature_workers,
         )
     logger.info(f"Training set: {len(X)} rows.")
     if X.empty:
@@ -319,6 +454,7 @@ def train(
                 X, y, asof_dates,
                 models_dir=models_dir, asof_date=asof_date,
                 target=DEFAULT_TARGET, objective=objective,
+                ensemble_seeds=n_ensemble,
             )
             logger.info(
                 f"CV done in {time.perf_counter() - cv_start:.1f}s. "
@@ -326,16 +462,35 @@ def train(
                 f"CV rank-IC: {cv_ic:+.4f}"
             )
 
+        if n_ensemble > 1 and seeds_are_inert(hyperparams):
+            # An XGBoost fit is only seed-dependent through its stochastic
+            # parts. At subsample/colsample >= 1.0 the N members would be
+            # bit-identical: N times the cost, zero variance reduction, and
+            # silent about it.
+            logger.warning(
+                "ensemble_seeds={} but the chosen hyperparameters have no "
+                "stochastic component (subsample/colsample >= 1.0) — every "
+                "member will be an IDENTICAL model at {}x the fit cost.",
+                n_ensemble, n_ensemble,
+            )
+
         logger.info("Training production model...")
         train_start = time.perf_counter()
+        # X/y were built ONCE above (the 65-80 min phase). The N seed fits
+        # share that one matrix — only the XGBoost fit repeats, seconds each.
         model = train_xgb(
             X,
             y,
             hyperparams=hyperparams,
             asof_dates=asof_dates,
             objective=objective,
+            ensemble_seeds=n_ensemble,
         )
         train_duration = time.perf_counter() - train_start
+        if ensemble_size(model) > 1:
+            logger.info(
+                f"Ensemble trained on random_states {ensemble_random_states(model)}"
+            )
         # True IN-SAMPLE RMSE (fit error). The gap vs cv_rmse is the overfit
         # signal; this is what `train_rmse` should mean (historically it was
         # mistakenly fed the CV value).
@@ -371,9 +526,22 @@ def train(
         elif _inc_label_type is not None and _inc_label_type != _new_label_type:
             # Clean label-type transition: RMSE scales aren't comparable across
             # raw vs demeaned targets, so promote the new type (2026-06-13).
+            # A transition is ~always a deliberate one-time event, so PAGE it:
+            # the 2026-06-29 incident rode this exact branch to silently deploy
+            # an accidental demean->raw regression (plist drift dropped the
+            # flag). Loud beats silent for anything that changes what the live
+            # model learns.
             logger.warning(
                 "label_type transition {} -> {}; promoting (RMSE incomparable)",
                 _inc_label_type, _new_label_type,
+            )
+            notify_failure(
+                title="SMA retrain: label-type TRANSITION deployed",
+                message=(
+                    f"live model label_type changed {_inc_label_type} -> "
+                    f"{_new_label_type}. If this wasn't deliberate, the "
+                    "scheduler args regressed (see 2026-06-29 incident)."
+                ),
             )
             promote = True
         elif (
@@ -442,8 +610,22 @@ def train(
                 "promoted": promote,
                 "training_rows": len(X),
                 "objective": objective,
+                # How many boosters the promoted artifact holds, so the
+                # sentinel trail shows when the ensemble started serving.
+                "ensemble_seeds": ensemble_size(model),
             },
         )
+
+        # Retention (2026-08-24 audit): models_artifacts/ had no pruning and
+        # grew unboundedly. Best-effort — never fails the retrain job over a
+        # housekeeping error, mirroring sma.backup.runner's pattern for its
+        # own end-of-job cleanup steps.
+        try:
+            pruned = prune_old_artifacts(models_dir, asof_date, DEFAULT_TARGET)
+            if pruned:
+                logger.info("retrain: pruned {} old artifact(s): {}", len(pruned), pruned)
+        except Exception as exc:
+            logger.exception("retrain: artifact pruning FAILED: {}", exc)
 
     verb = "Saved+deployed" if promote else "Saved but QUARANTINED (worse than incumbent)"
     click.echo(

@@ -10,9 +10,11 @@ import streamlit as st
 from dashboard.data import DB_PATH
 from sma.db_connect import read_only_connect
 
-# OVERRIDE_CATALYST_FLAGS mirrors the set in
-# src/sma/backtest/strategies/xgb_top_k.py — these are the flags the strategy
-# treats as "real catalyst" for the outside-top-30 override gate.
+# Flags treated as a "real catalyst" for the `catalyst?` column below. This set
+# used to mirror XGBoostTopK.OVERRIDE_CATALYST_FLAGS, but that outside-top-30
+# override was specced and never wired into decide(), so the constant and its
+# helper were deleted in 2026-08. This copy is now purely DISPLAY: it flags
+# which strong_bullish theses cite a catalyst, and gates nothing.
 _OVERRIDE_CATALYST_FLAGS = {
     "earnings_beat", "guidance_raise", "m&a_announcement",
     "regulatory_win", "fda_approval", "secular_inflection",

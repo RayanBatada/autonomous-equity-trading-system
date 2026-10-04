@@ -9,7 +9,7 @@ from pathlib import Path
 import click
 from loguru import logger
 
-from sma.backup.runner import DEFAULT_BACKUP_DIR, run_backup
+from sma.backup.runner import DEFAULT_BACKUP_DIR, DEFAULT_OFFSITE_BACKUP_DIR, run_backup
 
 
 @click.group()
@@ -37,6 +37,18 @@ def cli() -> None:
     help="Path to source DuckDB file (default: data/sma.duckdb)",
 )
 @click.option(
+    "--offsite-dir",
+    default=None,
+    help=(
+        "Destination directory for the offsite copy (default: "
+        "SMA_OFFSITE_BACKUP_DIR env var, else the iCloud sma-backups folder). "
+        "2026-08-24: this had NO override before — any ad-hoc/test run of "
+        "this command (e.g. against a worktree's dev DB) silently landed its "
+        "offsite copy in the real folder under the real filename. Always "
+        "pass this explicitly for anything other than the real scheduled job."
+    ),
+)
+@click.option(
     "--models-dir",
     default="models_artifacts",
     help="Model artifacts dir to include in the backup set (2026-06-11: the "
@@ -58,6 +70,7 @@ def run(
     asof: str | None,
     backup_dir: str | None,
     db: str,
+    offsite_dir: str | None,
     retain_days: int,
     retain_months: int,
     models_dir: str,
@@ -76,19 +89,32 @@ def run(
         ).expanduser()
     )
 
+    resolved_offsite_dir = (
+        Path(offsite_dir).expanduser()
+        if offsite_dir is not None
+        else Path(
+            os.environ.get(
+                "SMA_OFFSITE_BACKUP_DIR",
+                str(DEFAULT_OFFSITE_BACKUP_DIR),
+            )
+        ).expanduser()
+    )
+
     db_path = Path(db)
 
     logger.info(
-        "backup: starting for asof={} db={} backup_dir={}",
+        "backup: starting for asof={} db={} backup_dir={} offsite_dir={}",
         asof_date,
         db_path,
         resolved_backup_dir,
+        resolved_offsite_dir,
     )
 
     payload = run_backup(
         models_dir=Path(models_dir),
         db_path=db_path,
         backup_dir=resolved_backup_dir,
+        offsite_dir=resolved_offsite_dir,
         asof=asof_date,
         retain_days=retain_days,
         retain_months=retain_months,
@@ -110,10 +136,6 @@ def run(
             message=f"{payload['backup_path']} could not be read back — may be corrupt.",
         )
         raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    cli()
 
 
 @cli.command("restore")
@@ -177,3 +199,11 @@ def restore_cmd(asof, backup_dir, db, models_dir, yes) -> None:
             click.echo(f"restored {n} model files -> {mdir}")
         else:
             click.echo(f"no models-{target_date} in backup set (DB-only restore)")
+
+
+# Must stay at the very END of the module: `python -m sma.backup <cmd>` runs the
+# file top-to-bottom, so this guard MUST come AFTER every @cli.command is
+# registered — otherwise cli() dispatches before the later commands exist and
+# they are unreachable when executed as a module (2026-07-04: `restore` was dead).
+if __name__ == "__main__":
+    cli()

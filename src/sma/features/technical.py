@@ -7,19 +7,47 @@ or None if insufficient history.
 Lookahead contract: for any (ticker_prices, asof_date), the function's output
 must depend ONLY on rows where date <= asof_date. Adding rows with date >
 asof_date to the input must not change the output. Tested adversarially.
+
+Every function may ALSO be handed a `window.PriceWindow` — the same rows,
+truncated and sorted once — wherever it takes a price frame. Same maths, same
+result; it exists because these ~22 functions run per (ticker, asof) and each
+one used to redo the truncation for itself, which was 67.0s of a 101.4s feature
+build. `_rows_up_to` is the only place that distinguishes the two, and a frame
+remains the documented, always-correct input for outside callers.
 """
 
 from datetime import date
 
 import pandas as pd
 
+from sma.features.window import PriceWindow, truncate_and_sort
 
-def _rows_up_to(prices: pd.DataFrame, asof_date: date) -> pd.DataFrame:
-    """Return the prices subset with date <= asof_date, sorted ascending."""
-    return prices[prices["date"] <= asof_date].sort_values("date")
+# What a feature function accepts as a ticker's price history: the raw frame
+# (masked and sorted on the spot) or a window someone already built for this
+# asof_date.
+PriceRows = pd.DataFrame | PriceWindow
 
 
-def _adj_close_n_back(prices: pd.DataFrame, asof_date: date, n: int) -> float | None:
+def _rows_up_to(prices: PriceRows, asof_date: date) -> pd.DataFrame:
+    """Return the prices subset with date <= asof_date, sorted ascending.
+
+    Hands back a PriceWindow's rows untouched — that IS the subset, computed
+    once by whoever built the window. The asof_date check is not paranoia: a
+    window carried to the wrong date returns a plausible-looking feature value
+    rather than an error, which is the one failure mode nothing downstream
+    could catch.
+    """
+    if isinstance(prices, PriceWindow):
+        if prices.asof_date != asof_date:
+            raise ValueError(
+                f"PriceWindow was built for {prices.asof_date} but used at "
+                f"{asof_date}; build one window per (ticker, asof_date)."
+            )
+        return prices.rows
+    return truncate_and_sort(prices, asof_date)
+
+
+def _adj_close_n_back(prices: PriceRows, asof_date: date, n: int) -> float | None:
     """Return adj_close from n trading days before asof_date.
 
     Returns None if there are fewer than n+1 rows at or before asof_date.
@@ -31,7 +59,7 @@ def _adj_close_n_back(prices: pd.DataFrame, asof_date: date, n: int) -> float | 
     return float(visible.iloc[-(n + 1)]["adj_close"])
 
 
-def ret_n_days(prices: pd.DataFrame, asof_date: date, n: int) -> float | None:
+def ret_n_days(prices: PriceRows, asof_date: date, n: int) -> float | None:
     """N-trading-day total return: (adj_close[asof] / adj_close[asof - n]) - 1.
 
     Returns None if insufficient history or if either price is non-positive.
@@ -46,19 +74,19 @@ def ret_n_days(prices: pd.DataFrame, asof_date: date, n: int) -> float | None:
     return (asof_px / prev_px) - 1.0
 
 
-def ret_1d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def ret_1d(prices: PriceRows, asof_date: date) -> float | None:
     return ret_n_days(prices, asof_date, 1)
 
 
-def ret_5d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def ret_5d(prices: PriceRows, asof_date: date) -> float | None:
     return ret_n_days(prices, asof_date, 5)
 
 
-def ret_20d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def ret_20d(prices: PriceRows, asof_date: date) -> float | None:
     return ret_n_days(prices, asof_date, 20)
 
 
-def ret_60d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def ret_60d(prices: PriceRows, asof_date: date) -> float | None:
     return ret_n_days(prices, asof_date, 60)
 
 
@@ -74,7 +102,7 @@ def _daily_returns_from_adjclose(visible: pd.DataFrame) -> pd.Series:
 # T3: Volatility
 # ---------------------------------------------------------------------------
 
-def vol_20d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def vol_20d(prices: PriceRows, asof_date: date) -> float | None:
     """Standard deviation of last 20 daily returns. None if fewer than 21 rows."""
     visible = _rows_up_to(prices, asof_date)
     if len(visible) < 21:
@@ -83,7 +111,7 @@ def vol_20d(prices: pd.DataFrame, asof_date: date) -> float | None:
     return float(rets.iloc[-20:].std(ddof=1))
 
 
-def vol_60d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def vol_60d(prices: PriceRows, asof_date: date) -> float | None:
     """Standard deviation of last 60 daily returns. None if fewer than 61 rows."""
     visible = _rows_up_to(prices, asof_date)
     if len(visible) < 61:
@@ -96,7 +124,7 @@ def vol_60d(prices: pd.DataFrame, asof_date: date) -> float | None:
 # T4: RSI
 # ---------------------------------------------------------------------------
 
-def rsi_14(prices: pd.DataFrame, asof_date: date) -> float | None:
+def rsi_14(prices: PriceRows, asof_date: date) -> float | None:
     """14-day RSI using Wilder smoothing on adj_close. None if fewer than 15 rows."""
     visible = _rows_up_to(prices, asof_date)
     if len(visible) < 15:
@@ -132,7 +160,7 @@ def rsi_14(prices: pd.DataFrame, asof_date: date) -> float | None:
 # T5: Volume
 # ---------------------------------------------------------------------------
 
-def volume_z_20d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def volume_z_20d(prices: PriceRows, asof_date: date) -> float | None:
     """Z-score of asof volume vs the trailing 20 days (excluding asof).
 
     None if fewer than 21 rows or if the trailing std is zero.
@@ -149,7 +177,7 @@ def volume_z_20d(prices: pd.DataFrame, asof_date: date) -> float | None:
     return (today_vol - mean) / std
 
 
-def dollar_volume_20d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def dollar_volume_20d(prices: PriceRows, asof_date: date) -> float | None:
     """Mean of (close * volume) over the last 20 trading days including asof.
 
     None if fewer than 20 rows.
@@ -166,7 +194,7 @@ def dollar_volume_20d(prices: pd.DataFrame, asof_date: date) -> float | None:
 # T6: Cross-sectional + price
 # ---------------------------------------------------------------------------
 
-def gap_open(prices: pd.DataFrame, asof_date: date) -> float | None:
+def gap_open(prices: PriceRows, asof_date: date) -> float | None:
     """(open[asof] - close[asof - 1 trading day]) / close[asof - 1 trading day].
 
     None if fewer than 2 rows or prior close <= 0.
@@ -181,7 +209,7 @@ def gap_open(prices: pd.DataFrame, asof_date: date) -> float | None:
     return (asof_open - prior_close) / prior_close
 
 
-def dist_from_52w_high(prices: pd.DataFrame, asof_date: date) -> float | None:
+def dist_from_52w_high(prices: PriceRows, asof_date: date) -> float | None:
     """(adj_close[asof] / max(adj_close over last 252 days including asof)) - 1.
 
     Returns 0.0 if asof is at the high; negative otherwise. None if <252 rows.
@@ -196,8 +224,8 @@ def dist_from_52w_high(prices: pd.DataFrame, asof_date: date) -> float | None:
 
 
 def rel_strength_spy_60d(
-    target_prices: pd.DataFrame,
-    spy_prices: pd.DataFrame,
+    target_prices: PriceRows,
+    spy_prices: PriceRows,
     asof_date: date,
 ) -> float | None:
     """ret_60d(target) - ret_60d(SPY). None if either return is None.
@@ -212,8 +240,8 @@ def rel_strength_spy_60d(
 
 
 def rel_strength_sector_etf_30d(
-    target_prices: pd.DataFrame,
-    sector_etf_prices: pd.DataFrame,
+    target_prices: PriceRows,
+    sector_etf_prices: PriceRows,
     asof_date: date,
 ) -> float | None:
     """ret_30d(target) - ret_30d(sector_etf).
@@ -238,8 +266,8 @@ def rel_strength_sector_etf_30d(
 
 
 def rel_strength_sector_30d(
-    target_prices: pd.DataFrame,
-    sector_peer_prices: list[pd.DataFrame],
+    target_prices: PriceRows,
+    sector_peer_prices: list[PriceRows],
     asof_date: date,
 ) -> float | None:
     """ret_30d(target) - mean(ret_30d(p)) over OTHER tickers in same sector.
@@ -257,10 +285,30 @@ def rel_strength_sector_30d(
     Excluding self prevents the ticker from being part of its own
     benchmark — a single-ticker sector would otherwise always score 0.
     """
-    target_ret = ret_n_days(target_prices, asof_date, 30)
+    return rel_strength_sector_30d_from_returns(
+        ret_n_days(target_prices, asof_date, 30),
+        [ret_n_days(p, asof_date, 30) for p in sector_peer_prices],
+    )
+
+
+def rel_strength_sector_30d_from_returns(
+    target_ret: float | None,
+    peer_rets: list[float | None],
+) -> float | None:
+    """rel_strength_sector_30d on PRECOMPUTED 30d returns.
+
+    Same maths, same None rules — this is the single implementation and the
+    DataFrame-taking version above delegates to it. It exists because the
+    frame-taking form is quadratic when a whole sector is scored at once: each
+    target recomputes every peer's 30d return, so a sector of S names does
+    S*(S-1) computations for S distinct values. build_features computes each
+    ticker's 30d return once and passes the numbers in.
+
+    `peer_rets` MUST arrive in the caller's peer order: the mean is a plain
+    left-to-right float sum, so reordering it would change the last bits.
+    """
     if target_ret is None:
         return None
-    peer_rets = [ret_n_days(p, asof_date, 30) for p in sector_peer_prices]
     peer_rets = [r for r in peer_rets if r is not None]
     if len(peer_rets) < 2:
         return None
@@ -275,8 +323,8 @@ def rel_strength_sector_30d(
 # ---------------------------------------------------------------------------
 
 def vol_adj_mom_60d(
-    target_prices: pd.DataFrame,
-    spy_prices: pd.DataFrame,
+    target_prices: PriceRows,
+    spy_prices: PriceRows,
     asof_date: date,
 ) -> float | None:
     """SPY-relative 60d return divided by 60d realized vol (risk-adjusted
@@ -290,7 +338,7 @@ def vol_adj_mom_60d(
     return float(rel / vol)
 
 
-def downside_vol_ratio_60d(prices: pd.DataFrame, asof_date: date) -> float | None:
+def downside_vol_ratio_60d(prices: PriceRows, asof_date: date) -> float | None:
     """std(negative daily returns) / std(all daily returns) over the last 60
     sessions — crash-asymmetry. ~0 for smooth uptrends; →1 when volatility is
     dominated by down moves. None with <61 rows or ~zero total vol."""
@@ -307,7 +355,7 @@ def downside_vol_ratio_60d(prices: pd.DataFrame, asof_date: date) -> float | Non
     return float(downs.std(ddof=1) * (len(downs) / len(rets)) ** 0.5 / total)
 
 
-def reversal_5d_z(prices: pd.DataFrame, asof_date: date) -> float | None:
+def reversal_5d_z(prices: PriceRows, asof_date: date) -> float | None:
     """5d return scaled by 20d daily vol — the short-term reversal input in
     comparable units across names. None when either leg is unavailable."""
     r5 = ret_n_days(prices, asof_date, 5)

@@ -170,3 +170,58 @@ def test_build_features_neutralizes_sector_etf_bucket():
     assert result.loc["XLK", "rel_strength_sector_30d"] == 0.0
     assert result.loc["XLE", "rel_strength_sector_30d"] == 0.0
     assert result.loc["XLF", "rel_strength_sector_30d"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Precomputed-returns form (2026-08-17). build_features computes each ticker's
+# 30d return once and passes the numbers in, instead of every target
+# recomputing every peer's return. The frame-taking function above now
+# delegates here, so these two must never drift apart.
+# ---------------------------------------------------------------------------
+
+def test_from_returns_matches_the_frame_form():
+    from sma.features.technical import (
+        rel_strength_sector_30d_from_returns,
+        ret_n_days,
+    )
+
+    start = date(2024, 1, 1)
+    target = _synthetic_prices("TGT1", start, 90, daily_log_ret=0.003)
+    peers = [
+        _synthetic_prices("PEER1", start, 90, daily_log_ret=0.001),
+        _synthetic_prices("PEER2", start, 90, daily_log_ret=-0.002),
+        _synthetic_prices("PEER3", start, 90, daily_log_ret=0.0005),
+    ]
+    asof = target["date"].max()
+
+    frame_form = rel_strength_sector_30d(target, peers, asof)
+    numbers_form = rel_strength_sector_30d_from_returns(
+        ret_n_days(target, asof, 30),
+        [ret_n_days(p, asof, 30) for p in peers],
+    )
+    assert frame_form == numbers_form
+
+
+def test_from_returns_none_rules():
+    """Same None contract as the frame form: no target return, or fewer than
+    two usable peers, means no signal."""
+    from sma.features.technical import rel_strength_sector_30d_from_returns
+
+    assert rel_strength_sector_30d_from_returns(None, [0.1, 0.2]) is None
+    assert rel_strength_sector_30d_from_returns(0.1, []) is None
+    assert rel_strength_sector_30d_from_returns(0.1, [0.2]) is None
+    assert rel_strength_sector_30d_from_returns(0.1, [0.2, None]) is None
+    assert rel_strength_sector_30d_from_returns(0.1, [None, None, 0.2]) is None
+    # Two usable peers is the threshold, and Nones are dropped not counted.
+    assert rel_strength_sector_30d_from_returns(0.5, [0.1, 0.3, None]) == 0.3
+
+
+def test_from_returns_mean_is_a_left_to_right_float_sum():
+    """The peer mean is sum()/len() in the caller's order. build_features
+    preserves peer order for exactly this reason — a reordering would move the
+    last bits of every sector feature and silently change trained models."""
+    from sma.features.technical import rel_strength_sector_30d_from_returns
+
+    peers = [0.1, 0.2, 0.3]
+    expected = 1.0 - (sum(peers) / len(peers))
+    assert rel_strength_sector_30d_from_returns(1.0, peers) == expected

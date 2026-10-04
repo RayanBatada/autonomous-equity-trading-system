@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from sma.model.ensemble import DEFAULT_BASE_SEED, EnsembleModel, ensemble_seed_list
+
 DEFAULT_HYPERPARAMS: dict = {
     "max_depth": 5,
     "n_estimators": 300,
@@ -24,8 +26,9 @@ def train_xgb(
     *,
     asof_dates: pd.Series | None = None,
     objective: str = "reg",
-) -> xgb.XGBRegressor | xgb.XGBRanker:
-    """Train one XGBoost model on (X, y).
+    ensemble_seeds: int = 1,
+) -> xgb.XGBRegressor | xgb.XGBRanker | EnsembleModel:
+    """Train one XGBoost model on (X, y) — or a seed ensemble of them.
 
     Args:
         X: feature DataFrame.
@@ -34,8 +37,20 @@ def train_xgb(
         asof_dates: per-row asof dates. Required for objective="rank" so
             XGBoost can receive one query group per date.
         objective: "reg" for XGBRegressor, "rank" for XGBRanker.
+        ensemble_seeds: how many models to fit. 1 (the default, so every
+            existing caller keeps its behaviour untouched) returns a single
+            fitted estimator exactly as this function always has. N > 1 fits N
+            models differing ONLY in random_state — base, base+1, ..., where
+            base is the hyperparams' random_state — and returns an
+            EnsembleModel that predicts their arithmetic mean. That is the
+            10-seed ensemble adopted 2026-08-24; see sma.model.ensemble.
 
-    Returns the fitted model.
+    IMPORTANT: this function takes an ALREADY-BUILT (X, y). The N seed fits
+    share one feature matrix — only the XGBoost fit repeats. Building the
+    training set is the expensive phase (65-80 min in production vs seconds
+    per fit), and nothing here can trigger a rebuild.
+
+    Returns the fitted model, or an EnsembleModel when ensemble_seeds > 1.
     """
     if X.empty or len(y) == 0:
         raise ValueError("Cannot train on empty data.")
@@ -43,17 +58,47 @@ def train_xgb(
         raise ValueError(f"X has {len(X)} rows but y has {len(y)} values.")
     if objective not in {"reg", "rank"}:
         raise ValueError("objective must be 'reg' or 'rank'.")
+    if isinstance(ensemble_seeds, bool) or not isinstance(ensemble_seeds, int):
+        raise ValueError(f"ensemble_seeds must be an int; got {ensemble_seeds!r}")
+    if ensemble_seeds < 1:
+        raise ValueError(f"ensemble_seeds must be >= 1; got {ensemble_seeds}")
 
     params = {**DEFAULT_HYPERPARAMS, **(hyperparams or {})}
     if objective == "rank":
+        # Query-group construction is a pure function of the inputs, so it is
+        # done ONCE and reused by every member rather than per seed.
         X_fit, y_fit, groups = _prepare_rank_training_data(X, y, asof_dates)  # noqa: N806
         params["objective"] = "rank:pairwise"
+    else:
+        X_fit, y_fit, groups = X, y, None  # noqa: N806
+
+    if ensemble_seeds == 1:
+        # Untouched single-model path: `params` goes through verbatim,
+        # random_state included, so a 1-seed fit is bit-identical to what this
+        # function returned before ensembles existed (verified by test).
+        return _fit_one(params, X_fit, y_fit, groups)
+
+    base = params.get("random_state")
+    base = DEFAULT_BASE_SEED if base is None else int(base)
+    return EnsembleModel([
+        _fit_one({**params, "random_state": seed}, X_fit, y_fit, groups)
+        for seed in ensemble_seed_list(base, ensemble_seeds)
+    ])
+
+
+def _fit_one(
+    params: dict,
+    X_fit: pd.DataFrame,  # noqa: N803
+    y_fit: pd.Series,
+    groups: list[int] | None,
+) -> xgb.XGBRegressor | xgb.XGBRanker:
+    """Fit exactly one estimator. Non-None `groups` selects the ranker path."""
+    if groups is not None:
         model = xgb.XGBRanker(**params)
         model.fit(X_fit, y_fit, group=groups)
         return model
-
     model = xgb.XGBRegressor(**params)
-    model.fit(X, y)
+    model.fit(X_fit, y_fit)
     return model
 
 
@@ -138,9 +183,14 @@ def cv_information_coefficient(
     n_folds: int = 5,
     purge_days: int = 30,
     objective: str = "reg",
+    ensemble_seeds: int = 1,
 ) -> float:
     """Held-out walk-forward rank-IC: mean per-asof Spearman correlation of
     out-of-fold predictions vs realized targets.
+
+    With ensemble_seeds > 1 each fold fits N models and the IC is measured on
+    their MEAN out-of-fold prediction — i.e. on the thing that will actually
+    trade, so the IC floor gates the ensemble rather than seed 42 alone.
 
     The deploy gate has always used CV-RMSE, which measures point-error, not
     RANKING ability — and this is a ranker (decide only sorts by score). A
@@ -160,6 +210,7 @@ def cv_information_coefficient(
         model = train_xgb(
             X.iloc[train_idx], y.iloc[train_idx], hyperparams=params,
             asof_dates=asof_dates.iloc[train_idx], objective=objective,
+            ensemble_seeds=ensemble_seeds,
         )
         preds = model.predict(X.iloc[val_idx])
         va = pd.DataFrame({
@@ -184,9 +235,15 @@ def walk_forward_cv_rmse(
     n_folds: int = 5,
     purge_days: int = 30,
     objective: str = "reg",
+    ensemble_seeds: int = 1,
 ) -> float:
     """Held-out walk-forward CV RMSE for ONE param set — the point-error sibling
     of cv_information_coefficient.
+
+    With ensemble_seeds > 1 the RMSE is measured on the ensemble-MEAN
+    out-of-fold prediction, so the number stored as `cv_rmse` (and compared
+    against the incumbent by should_promote) describes the ensemble that will
+    serve, not one of its members.
 
     The autoresearch config search selects by IC, so it knows the winner's CV-IC
     but not its CV-RMSE. Persisting a real cv_rmse (instead of NaN) keeps the
@@ -203,6 +260,7 @@ def walk_forward_cv_rmse(
         model = train_xgb(
             X.iloc[train_idx], y.iloc[train_idx], hyperparams=params,
             asof_dates=asof_dates.iloc[train_idx], objective=objective,
+            ensemble_seeds=ensemble_seeds,
         )
         preds = model.predict(X.iloc[val_idx])
         rmse = float(np.sqrt(np.mean((preds - y.iloc[val_idx].to_numpy()) ** 2)))
@@ -218,11 +276,18 @@ def select_hyperparams(
     purge_days: int = 30,
     *,
     objective: str = "reg",
+    ensemble_seeds: int = 1,
 ) -> tuple[dict, float]:
     """Run walk-forward CV across a small grid; return (best_params, best_rmse).
 
     Grid: max_depth in {3, 5, 7}, learning_rate in {0.05, 0.1}. n_estimators
     fixed at 300. 6 combinations total.
+
+    ensemble_seeds scores every grid point on ensemble-mean predictions. That
+    matters beyond config selection: the winner's RMSE is returned as the
+    retrain's `cv_rmse`, which is exactly what should_promote() compares to the
+    incumbent — scoring the grid single-seed would gate an ensemble on a
+    single-seed number.
     """
     grid = []
     for max_depth in [3, 5, 7]:
@@ -249,6 +314,7 @@ def select_hyperparams(
                 hyperparams=params,
                 asof_dates=asof_dates.iloc[train_idx],
                 objective=objective,
+                ensemble_seeds=ensemble_seeds,
             )
             preds = model.predict(X_va)
             rmse = float(np.sqrt(np.mean((preds - y_va.to_numpy()) ** 2)))
@@ -274,22 +340,30 @@ def select_hyperparams_keep_better_ic(
     objective: str = "reg",
     n_folds: int = 5,
     purge_days: int = 30,
+    ensemble_seeds: int = 1,
 ) -> tuple[dict, float, float]:
     """Pick retrain hyperparameters: the RMSE-grid winner, UNLESS the currently
     deployed model's OWN config scores a higher walk-forward CV-IC on this data —
     then keep the incumbent's config. This keeps a good config (from a past
     retrain or an autoresearch win) across weeks instead of re-rolling it by RMSE
     every time (2026-06-23). Returns (hyperparams, cv_ic, cv_rmse).
+
+    ensemble_seeds is threaded into EVERY measurement here — the grid, the
+    grid winner's IC, the incumbent config's IC, and the incumbent's RMSE — so
+    the (cv_ic, cv_rmse) this returns describe the ensemble end to end and the
+    incumbent-vs-candidate comparison stays apples-to-apples (study PART 8).
     """
     from sma.model.persistence import incumbent_hyperparams
 
     best_params, grid_rmse = select_hyperparams(
         X, y, asof_dates, n_folds, purge_days, objective=objective,
+        ensemble_seeds=ensemble_seeds,
     )
     grid_full = {**DEFAULT_HYPERPARAMS, **best_params}
     grid_ic = cv_information_coefficient(
         X, y, asof_dates, best_params,
         n_folds=n_folds, purge_days=purge_days, objective=objective,
+        ensemble_seeds=ensemble_seeds,
     )
     chosen, cv_ic, cv_rmse = grid_full, grid_ic, grid_rmse
 
@@ -299,6 +373,7 @@ def select_hyperparams_keep_better_ic(
             inc_ic = cv_information_coefficient(
                 X, y, asof_dates, inc_params,
                 n_folds=n_folds, purge_days=purge_days, objective=objective,
+                ensemble_seeds=ensemble_seeds,
             )
         except Exception:  # noqa: BLE001 - a bad deployed config must not abort the retrain
             inc_ic = float("nan")  # ignore it; keep the grid pick
@@ -308,5 +383,6 @@ def select_hyperparams_keep_better_ic(
             cv_rmse = walk_forward_cv_rmse(
                 X, y, asof_dates, inc_params,
                 n_folds=n_folds, purge_days=purge_days, objective=objective,
+                ensemble_seeds=ensemble_seeds,
             )
     return chosen, cv_ic, cv_rmse

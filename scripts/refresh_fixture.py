@@ -11,6 +11,7 @@ run on every test invocation. The fixture must be deterministic and committed.
 
 from pathlib import Path
 
+import pandas as pd
 import yfinance as yf
 
 from sma.ingest.store import Store
@@ -35,10 +36,15 @@ def main() -> None:
     for t in TICKERS:
         sub = df[t].dropna(how="all")
         for ts, r in sub.iterrows():
+            # 2026-09-18 incident audit: never write a row whose close is
+            # NaN/None into the committed fixture.
+            if pd.isna(r["Close"]):
+                continue
             rows.append((
                 t, ts.date(),
                 float(r["Open"]), float(r["High"]), float(r["Low"]),
-                float(r["Close"]), float(r["Adj Close"]),
+                float(r["Close"]),
+                None if pd.isna(r["Adj Close"]) else float(r["Adj Close"]),
                 int(r["Volume"]), "yfinance", rid,
             ))
     store.conn.executemany(

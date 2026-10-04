@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
-SCRATCH = "/private/tmp/claude-501/-Users-rayanbatada-SecondBrain/f0fae5bb-6213-478f-b88e-e8747330c663/scratchpad"
+SCRATCH = "/private/tmp/claude-501/-Users-youruser-SecondBrain/f0fae5bb-6213-478f-b88e-e8747330c663/scratchpad"
 sys.path.insert(0, SCRATCH)
 import shared_pit  # noqa: E402
 

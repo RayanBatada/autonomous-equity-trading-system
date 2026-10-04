@@ -453,6 +453,66 @@ def test_translate_dead_zone_does_not_block_full_exit():
     assert aapl_orders[0].shares == 100
 
 
+def test_translate_dead_zone_boundary_delta_exactly_at_threshold_is_suppressed():
+    """CAT bug (7/23-7/28 live): with the old `abs(delta) < dead_zone * held`
+    comparison, a delta EXACTLY at the threshold (held=10, delta=1, dead_zone
+    =0.10 -> 1.0) evaluated `1 < 1.0` = False, so the boundary rebalance
+    fired anyway. CAT did four 1-share round-trips paying spread each time.
+    Fixed to `<=` so an at-threshold delta is suppressed like anything
+    smaller."""
+    asof = date(2026, 7, 23)
+    out = translate(
+        decisions=[_decision("AAPL", weight=0.09)],  # target 9 vs held 10 -> delta -1 (10%)
+        current_positions={"AAPL": 10},
+        account_equity=100_000.0,
+        cash=10_000.0,
+        last_prices=_last_prices(asof=asof, AAPL=1_000.0),
+        asof_date=asof,
+        rails=RiskRails(rebalance_dead_zone_pct=0.10),
+    )
+    aapl_orders = [o for o in out if o.ticker == "AAPL"]
+    assert aapl_orders == [], (
+        f"exactly-at-threshold delta must be suppressed (got {aapl_orders})"
+    )
+
+
+def test_translate_dead_zone_delta_above_threshold_still_trades():
+    """A delta just ABOVE the threshold (held=10, delta=2 -> 20%) is a real
+    rebalance, not boundary noise, and must still fire."""
+    asof = date(2026, 7, 23)
+    out = translate(
+        decisions=[_decision("AAPL", weight=0.08)],  # target 8 vs held 10 -> delta -2 (20%)
+        current_positions={"AAPL": 10},
+        account_equity=100_000.0,
+        cash=10_000.0,
+        last_prices=_last_prices(asof=asof, AAPL=1_000.0),
+        asof_date=asof,
+        rails=RiskRails(rebalance_dead_zone_pct=0.10),
+    )
+    aapl_orders = [o for o in out if o.ticker == "AAPL"]
+    assert len(aapl_orders) == 1 and aapl_orders[0].side == "SELL"
+    assert aapl_orders[0].shares == 2
+
+
+def test_translate_dead_zone_boundary_smaller_held_still_trades_above_pct():
+    """held=5, delta=1 is 20% of held (above the 10% dead zone) -> must fire,
+    even though the absolute share count (1) matches the boundary case above.
+    The dead zone is a fraction of held shares, not a fixed share count."""
+    asof = date(2026, 7, 23)
+    out = translate(
+        decisions=[_decision("AAPL", weight=0.04)],  # target 4 vs held 5 -> delta -1 (20%)
+        current_positions={"AAPL": 5},
+        account_equity=100_000.0,
+        cash=10_000.0,
+        last_prices=_last_prices(asof=asof, AAPL=1_000.0),
+        asof_date=asof,
+        rails=RiskRails(rebalance_dead_zone_pct=0.10),
+    )
+    aapl_orders = [o for o in out if o.ticker == "AAPL"]
+    assert len(aapl_orders) == 1 and aapl_orders[0].side == "SELL"
+    assert aapl_orders[0].shares == 1
+
+
 def test_translate_dead_zone_zero_is_noop():
     """Default 0.0 preserves legacy behaviour: even tiny rebalances fire."""
     asof = date(2026, 5, 14)
@@ -645,6 +705,66 @@ def test_translate_cash_floor_partial_acceptance_when_running_cash_runs_out():
     assert all(o.side == "BUY" for o in out)
 
 
+def test_translate_sell_proceeds_haircut_buffers_rotation_buys():
+    """A haircut on ESTIMATED sell proceeds keeps a cash buffer so we do not
+    fund a rotation buy against proceeds that may not fully materialize at the
+    (lower) open fill. haircut=1.0 preserves legacy behavior."""
+    kw = dict(
+        decisions=[_decision("AAPL", weight=0.05), _decision("MSFT", weight=0.0)],
+        current_positions={"MSFT": 25},  # 25 @ 200 = $5,000 proceeds
+        account_equity=100_000.0,
+        cash=5_000.0,
+        last_prices=_last_prices(AAPL=200.0, MSFT=200.0),
+        asof_date=date(2026, 5, 1),
+    )
+    full = translate(
+        **kw, rails=RiskRails(stop_loss_pct=0.0, cash_floor_pct=0.05, sell_proceeds_haircut=1.0)
+    )
+    assert sorted((o.ticker, o.side) for o in full) == [("AAPL", "BUY"), ("MSFT", "SELL")]
+    # haircut 0.5 → only $2.5k of the $5k proceeds count → the $5k AAPL buy would
+    # drop cash below the $5k floor → blocked. Only the SELL remains.
+    cut = translate(
+        **kw, rails=RiskRails(stop_loss_pct=0.0, cash_floor_pct=0.05, sell_proceeds_haircut=0.5)
+    )
+    assert sorted((o.ticker, o.side) for o in cut) == [("MSFT", "SELL")]
+
+
+def test_translate_funds_highest_conviction_first_under_tight_cash():
+    """When cash only covers one buy, the higher-target_weight (higher
+    conviction) name wins, regardless of the order decisions arrive in."""
+    out = translate(
+        decisions=[_decision("ZZZ", weight=0.09), _decision("AAA", weight=0.10)],
+        current_positions={},
+        account_equity=100_000.0,
+        cash=15_000.0,
+        last_prices=_last_prices(AAA=200.0, ZZZ=200.0),
+        asof_date=date(2026, 5, 1),
+        rails=RiskRails(stop_loss_pct=0.0, cash_floor_pct=0.05),
+    )
+    buys = [o for o in out if o.side == "BUY"]
+    assert len(buys) == 1
+    assert buys[0].ticker == "AAA"  # 0.10 conviction funded before 0.09
+
+
+def test_translate_tie_weight_preserves_emission_conviction_order():
+    """When target weights TIE, the strategy's emission order (best first) is the
+    conviction signal and must be preserved — a stable sort must not reorder them
+    alphabetically (Codex HIGH 2026-07-01). ZZZ is emitted first (higher
+    conviction) at the same weight as AAA; with cash for only one, ZZZ wins."""
+    out = translate(
+        decisions=[_decision("ZZZ", weight=0.10), _decision("AAA", weight=0.10)],
+        current_positions={},
+        account_equity=10_000.0,
+        cash=1_000.0,
+        last_prices=_last_prices(AAA=100.0, ZZZ=100.0),
+        asof_date=date(2026, 5, 1),
+        rails=RiskRails(stop_loss_pct=0.0, cash_floor_pct=0.0),
+    )
+    buys = [o for o in out if o.side == "BUY"]
+    assert len(buys) == 1
+    assert buys[0].ticker == "ZZZ"  # emission order preserved, NOT alphabetical AAA
+
+
 def test_translate_drawdown_derisk_raises_floor_blocks_buys():
     """2026-06-16: drawdown-scaled de-risk (validated: slope 1.5 improved
     sharpe/return/maxDD on val). In a drawdown with slope>0 the effective cash
@@ -688,3 +808,47 @@ def test_translate_derisk_no_effect_at_peak():
         rails=rails_on, current_drawdown=0.0,
     )
     assert any(o.ticker == "AAPL" and o.side == "BUY" for o in out)
+
+
+def test_stale_price_does_not_swallow_held_name_reduction():
+    """2026-07-01 MEDIUM: the stale-price veto also swallowed SELLs of held
+    names AFTER pipeline.apply had already freed that sector room for buys —
+    breaching the sector cap with no alert. Reductions now size on the last
+    known (stale) price; buys stay vetoed."""
+    from datetime import date
+    stale = (100.0, date(2026, 1, 2))  # far older than the threshold
+    orders = translate(
+        decisions=[_decision("OLDP", 0.01)],
+        last_prices={"OLDP": stale},
+        account_equity=100_000.0,
+        cash=50_000.0,
+        current_positions={"OLDP": 50},  # target = 10 shares -> delta -40
+        asof_date=date(2026, 6, 30),
+    )
+    sells = [o for o in orders if o.side == "SELL"]
+    assert len(sells) == 1 and sells[0].shares == 40
+    # same staleness on a NON-held name (a buy) stays vetoed
+    orders = translate(
+        decisions=[_decision("OLDP", 0.01)],
+        last_prices={"OLDP": stale},
+        account_equity=100_000.0,
+        cash=50_000.0,
+        current_positions={},
+        asof_date=date(2026, 6, 30),
+    )
+    assert orders == []
+
+
+def test_missing_price_full_exit_still_sells():
+    """A target_weight=0 exit of a held name needs no price at all."""
+    from datetime import date
+    orders = translate(
+        decisions=[_decision("GONE", 0.0)],
+        last_prices={},
+        account_equity=100_000.0,
+        cash=50_000.0,
+        current_positions={"GONE": 30},
+        asof_date=date(2026, 6, 30),
+    )
+    sells = [o for o in orders if o.side == "SELL" and o.ticker == "GONE"]
+    assert len(sells) == 1 and sells[0].shares == 30

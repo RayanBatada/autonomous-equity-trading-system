@@ -1,11 +1,14 @@
 """Task 12: reconcile adopts writer_lock + writes sentinel."""
 
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 from sma.sentinels import read_sentinel
+
+ET = ZoneInfo("America/New_York")
 
 
 def _make_writer_lock_factory(lock_path: Path):
@@ -46,6 +49,17 @@ def _make_alpaca_mock() -> MagicMock:
     # Ancient next-session so reconcile's drift time-guard always passes
     # (this test exercises the sentinel write, not the time gate).
     alpaca.next_session_date.return_value = date(1970, 1, 1)
+    # backfill_missing_snapshots (2026-08-20) runs a calendar lookup at the
+    # start of every reconcile — an empty session list makes it a
+    # deterministic no-op for this test.
+    alpaca.sessions_between.return_value = []
+    # _pre_close_skip_reason (2026-08-20) gates the snapshot write on whether
+    # the snapshot date's session has closed — stub it so it never crashes on
+    # an unconfigured MagicMock; this test asserts on the sentinel, not on
+    # account_snapshots, so it doesn't matter whether the guard skips.
+    alpaca.session_window.side_effect = lambda *, day: (
+        datetime.combine(day, time(9, 30, tzinfo=ET)), datetime.combine(day, time(0, 0, tzinfo=ET))
+    )
     return alpaca
 
 

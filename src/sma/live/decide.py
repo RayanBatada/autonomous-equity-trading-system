@@ -21,6 +21,7 @@ Lifecycle:
 from __future__ import annotations
 
 import logging
+import statistics
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,9 +34,17 @@ from sma.backtest.strategies.base import StrategyDecision
 from sma.live.alpaca_client import AlpacaClient
 from sma.live.exceptions import EmptyDecisionsWithHeldPositionsError
 from sma.live.orders import Order, client_order_id, translate
+from sma.live.quantity import fmt_qty
+from sma.live.sizing import (
+    SizingPolicy,
+    min_viable_equity,
+    unfillable_names,
+)
+from sma.live.trade_push import build_push_orders_payload, build_trade_push
 from sma.risk.pipeline import RiskContext
 from sma.risk.pipeline import apply as apply_rails
 from sma.risk.rails import RiskRails
+from sma.strategies.base import call_strategy_decide
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +74,27 @@ class DecideResult:
     dry_run: bool
     decisions_after_rails: int
     skipped: int = 0
+    # (title, message) for the nightly ntfy trade push -- see
+    # sma.live.trade_push.build_trade_push. None on a dry run (nothing was
+    # actually submitted, so there is nothing to push about).
+    trade_push_title: str | None = None
+    trade_push_message: str | None = None
+    # 2026-09-04: structured per-order push payload (sma.live.trade_push.
+    # build_push_orders_payload) + the equity it was computed against, for
+    # sma.live.__main__ to persist via record_trade_push -- see
+    # sma.live.reconcile._detect_trade_push_drift. None on a dry run, same
+    # as the title/message fields above (nothing was actually submitted).
+    trade_push_orders: list[dict] | None = None
+    equity: float | None = None
+    # 2026-09-01 (sma.live.replay): the strategy's pre-rails output, the
+    # post-rails decisions, and the translated orders -- populated on EVERY
+    # return path (dry-run included) so replay can build a rich per-ticker
+    # report (holds/exits/entries/resizes + rail attribution) by calling this
+    # SAME function instead of re-implementing the pipeline. None-default
+    # keeps every existing caller/test that ignores these fields unaffected.
+    raw_decisions: list[StrategyDecision] | None = None
+    decisions: list[StrategyDecision] | None = None
+    orders: list[Order] | None = None
 
 
 class CatastrophicLossAbortError(Exception):
@@ -75,6 +105,53 @@ class CatastrophicLossAbortError(Exception):
 
 # Backward-compatible alias for callers that imported the original name.
 CatastrophicLossAbort = CatastrophicLossAbortError
+
+
+def _clean_snapshot_equities(store, asof: date) -> list[tuple[date, float]]:
+    """account_snapshots rows with asof_date <= `asof`, minus garbage rows.
+
+    Defensive guard (2026-07-30): the 2026-07-07 Alpaca broker wipe wrote a
+    garbage $6,935 equity row (real incident, self-healed the next day),
+    proving the broker CAN report garbage. An unfiltered garbage row corrupts
+    BOTH readers of this table in decide_once:
+      - the catastrophic-loss abort's "prior day" reference — a spuriously
+        HIGH prior row would make today's real equity look like a huge loss
+        and wrongly abort trading.
+      - the drawdown rail's running peak (MAX(equity)) — a spuriously HIGH
+        row would inflate the peak FOREVER (MAX never forgets), permanently
+        overstating drawdown and wedging the drawdown-scaled de-risk rail
+        into blocking all buys.
+    A row more than 50% away from the trailing median of the surrounding
+    snapshots is dropped before either read uses it. The median is robust to
+    a minority of outlier rows, so this is IDENTICAL to the unfiltered query
+    on clean data (nothing is close to 50% off a normal day-to-day median).
+    With fewer than 3 rows there isn't enough history for a meaningful
+    median, so nothing is filtered (thin history -> trust the data, matching
+    the pre-guard behavior).
+    """
+    rows = store.conn.execute(
+        "SELECT asof_date, equity FROM account_snapshots "
+        "WHERE asof_date <= ? AND equity IS NOT NULL ORDER BY asof_date",
+        [asof],
+    ).fetchall()
+    positive_equities = [e for _, e in rows if e and e > 0]
+    if len(positive_equities) < 3:
+        return rows
+    median = statistics.median(positive_equities)
+    if median <= 0:
+        return rows
+    clean = [
+        (d, e) for d, e in rows
+        if e and e > 0 and abs(e - median) / median <= 0.5
+    ]
+    dropped = len(rows) - len(clean)
+    if dropped:
+        logger.warning(
+            "decide: dropped %d garbage account_snapshots row(s) (>50%% from "
+            "trailing median $%.0f) before computing peak/prior-equity",
+            dropped, median,
+        )
+    return clean
 
 
 def _drawdown_from_peak(peak_equity: float, current_equity: float) -> float:
@@ -98,9 +175,11 @@ def decide_once(
     sector_for: Callable[[str], str],
     rails: RiskRails,
     catastrophic_loss_abort_pct: float = 0.30,
+    catastrophic_peak_drawdown_abort_pct: float = 0.25,
     price_lookback_days: int = 10,
     canary: str | None = None,
     dry_run: bool = False,
+    sizing: SizingPolicy | None = None,
 ) -> DecideResult:
     """Run one full decide cycle. Pre-flight must be run by caller before this.
 
@@ -117,19 +196,21 @@ def decide_once(
     account = alpaca.get_account()
     positions = alpaca.get_positions()
 
+    # 2026-07-30: both readers below share one garbage-filtered view of
+    # account_snapshots (see _clean_snapshot_equities) — a single isolated
+    # outlier row (the 2026-07-07 broker wipe wrote a garbage $6,935 row)
+    # must not corrupt the abort's prior-day reference OR the drawdown peak.
+    clean_snapshots = _clean_snapshot_equities(store, asof)
+
     # Catastrophic-loss circuit breaker (codex HIGH 2026-05-14). Pre-existing
     # reconcile detection only emitted an alert; nothing actually blocked the
     # next decide. If today's live equity has dropped >= the abort threshold
     # vs yesterday's recorded snapshot, refuse to trade until an operator
     # clears the condition. Skips gracefully when no prior snapshot exists.
     today_equity = float(account.get("equity", 0))
-    last_snap = store.conn.execute(
-        "SELECT equity FROM account_snapshots WHERE asof_date < ? "
-        "ORDER BY asof_date DESC LIMIT 1",
-        [asof],
-    ).fetchone()
-    if last_snap is not None and last_snap[0]:
-        prior_eq = float(last_snap[0])
+    prior_snapshots = [(d, e) for d, e in clean_snapshots if d < asof]
+    if prior_snapshots:
+        prior_eq = float(prior_snapshots[-1][1])  # most recent (rows are asc)
         drop = (prior_eq - today_equity) / prior_eq
         if drop >= catastrophic_loss_abort_pct:
             raise CatastrophicLossAbortError(
@@ -142,14 +223,29 @@ def decide_once(
     # Live drawdown for the max_drawdown rail: fraction below the running equity
     # peak (account_snapshots history + today's equity). Was hardcoded to 0.0,
     # which disabled the rail entirely (#1 from the live-path audit).
-    peak_row = store.conn.execute(
-        "SELECT MAX(equity) FROM account_snapshots WHERE asof_date <= ?",
-        [asof],
-    ).fetchone()
     peak_equity = max(
-        float(peak_row[0]) if peak_row and peak_row[0] else 0.0,
+        max((e for _, e in clean_snapshots), default=0.0),
         today_equity,
     )
+
+    # Peak-relative catastrophic-loss circuit breaker (2026-07-30 money-path
+    # review). The day-over-day check above only ever compares today vs
+    # YESTERDAY's snapshot, so it is unreachable by a slow bleed spread across
+    # many sub-threshold days (worst real single day so far: -5.1%) even
+    # though peak-to-trough drawdown has already hit -17.6% without tripping
+    # it. This reuses the SAME garbage-filtered peak computed above (never
+    # recomputed raw), so a spurious high snapshot can't false-trip this
+    # check any more than it can the drawdown rail.
+    if peak_equity > 0:
+        peak_drawdown = (peak_equity - today_equity) / peak_equity
+        if peak_drawdown >= catastrophic_peak_drawdown_abort_pct:
+            raise CatastrophicLossAbortError(
+                f"equity dropped {peak_drawdown:.1%} from peak "
+                f"(${peak_equity:,.0f} → ${today_equity:,.0f}); decide aborted "
+                f"(threshold={catastrophic_peak_drawdown_abort_pct:.1%}). "
+                "Review + clear before resuming."
+            )
+
     current_drawdown = _drawdown_from_peak(peak_equity, today_equity)
 
     prices = _load_prices(
@@ -166,17 +262,12 @@ def decide_once(
     # mirrors simulator.py). Without this the bearish-thesis veto saw held=∅
     # and force-sold merely-bearish HELD names in live trading — the exact
     # regression the 2e2c085 fix removed from the backtest path (Codex
-    # post-audit review, 2026-06-09).
-    import inspect
-
-    if "current_holdings" in inspect.signature(strategy.decide).parameters:
-        raw_decisions = strategy.decide(
-            asof_date=asof,
-            prices=prices,
-            current_holdings=set(positions.keys()),
-        )
-    else:
-        raw_decisions = strategy.decide(asof_date=asof, prices=prices)
+    # post-audit review, 2026-06-09). `strategy` is a SleeveBook on the real
+    # decide path (sma.strategies.allocator); its xgb_momentum sleeve makes
+    # this SAME call on the incumbent, so the two paths share one code path.
+    raw_decisions = call_strategy_decide(
+        strategy, asof=asof, prices=prices, current_holdings=set(positions.keys()),
+    )
     # Capture the strategy's raw approval set BEFORE rails. translate() uses
     # this to distinguish "model dropped this name" (force-sell held position)
     # from "rails blocked the re-buy" (keep held position).
@@ -216,8 +307,10 @@ def decide_once(
     # Entry dates feed BOTH translate's min_hold rail and the risk pipeline's
     # sector-room reservation: a held name whose full exit min_hold will veto
     # must keep its sector room reserved (Codex module review 2026-06-11).
+    # Only fills on or before `asof` count: a no-op live (no future fills exist
+    # at run time), but it keeps a replay of a past night point-in-time.
     position_entry_dates = _latest_buy_dates(
-        store=store, tickers=set(positions.keys()),
+        store=store, tickers=set(positions.keys()), asof=asof,
     )
     _min_hold = rails.min_hold_days if rails is not None else 0
     min_hold_protected = frozenset(
@@ -290,6 +383,47 @@ def decide_once(
             len(current_position_shares),
         )
 
+    sizing = sizing or SizingPolicy()
+
+    # Minimum-viable-equity warning (2026-08-27 scale audit). Whole-share sizing
+    # silently buys NOTHING of a name whose price exceeds its target slot, and
+    # the only previous evidence was a quiet absence in the order list. Below
+    # ~$25k on the current book that is most of the top-K; at $10k on the
+    # 2026-08-27 output it was LLY at $1,176/share against an $835 slot.
+    # This lives here rather than in run_preflight because preflight is
+    # deliberately sentinel-only — it opens neither the DB nor the broker (the
+    # 2026-04-30 writer-blocks-self deadlock) and so cannot see equity or prices.
+    unfillable = unfillable_names(
+        decisions=decisions,
+        account_equity=account["equity"],
+        last_prices=last_prices,
+        sizing=sizing,
+    )
+    if unfillable:
+        needed = min_viable_equity(decisions=decisions, last_prices=last_prices)
+        logger.warning(
+            "SIZING: %d of %d decided names cannot be filled in whole shares at "
+            "equity %s — %s. Every one of these gets ZERO shares and the "
+            "model's view of them never reaches the market. Set "
+            "live.sizing.fractional_shares: true to hold them, or fund the "
+            "account to ~%s to hold the whole book in whole shares.",
+            len(unfillable), len(decisions), f"${account['equity']:,.0f}",
+            ", ".join(
+                f"{u.ticker} (${u.target_dollars:,.2f} slot vs ${u.price:,.2f}/share)"
+                for u in unfillable
+            ),
+            f"${needed or 0.0:,.0f}",
+        )
+
+    adv_dollars = (
+        _load_adv_dollars(
+            store=store, universe=universe, asof=asof,
+            lookback=sizing.adv_lookback_days,
+        )
+        if sizing.max_participation_of_adv > 0
+        else {}
+    )
+
     orders = translate(
         decisions=decisions,
         current_positions=current_position_shares,
@@ -301,32 +435,59 @@ def decide_once(
         model_approved_tickers=model_approved_tickers,
         position_entry_dates=position_entry_dates,
         current_drawdown=current_drawdown,
+        sizing=sizing,
+        adv_dollars=adv_dollars,
     )
+    _capped = [o for o in orders if o.capped_by]
+    if _capped:
+        logger.warning(
+            "SIZING: ADV participation cap trimmed %d order(s): %s. The untrimmed "
+            "remainder is not queued — tomorrow's decide recomputes it.",
+            len(_capped),
+            ", ".join(f"{o.side} {o.ticker}" for o in _capped),
+        )
     logger.info("translated %d decisions → %d orders", len(decisions), len(orders))
 
     if dry_run:
         for o in orders:
             price_str = f"${o.last_price:.2f}" if o.last_price else "N/A"
-            print(f"  [dry-run] {o.side:4s} {o.shares:5d} {o.ticker:6s} @ ~{price_str} ({o.type})")
+            qty_str = fmt_qty(o.shares, width=5)
+            print(f"  [dry-run] {o.side:4s} {qty_str} {o.ticker:6s} @ ~{price_str} ({o.type})")
         return DecideResult(
             submitted=0,
             failed=0,
             dry_run=True,
             decisions_after_rails=len(decisions),
+            raw_decisions=raw_decisions,
+            decisions=decisions,
+            orders=orders,
         )
 
     run_id = store.allocate_run_id()
     submitted, failed, skipped = 0, 0, 0
+    submitted_orders: list[Order] = []
     for o in orders:
         outcome = _submit_with_audit_trail(
             o, asof=asof, store=store, alpaca=alpaca, run_id=run_id, decisions=decisions
         )
         if outcome == "submitted":
             submitted += 1
+            submitted_orders.append(o)
         elif outcome == "skipped":
             skipped += 1
         else:
             failed += 1
+
+    trade_push_title, trade_push_message = build_trade_push(
+        asof=asof,
+        submitted_orders=submitted_orders,
+        decisions=decisions,
+        equity=account["equity"],
+        position_count=len(current_position_shares),
+    )
+    trade_push_orders = build_push_orders_payload(
+        submitted_orders=submitted_orders, equity=account["equity"],
+    )
 
     return DecideResult(
         submitted=submitted,
@@ -334,6 +495,13 @@ def decide_once(
         skipped=skipped,
         dry_run=False,
         decisions_after_rails=len(decisions),
+        trade_push_title=trade_push_title,
+        trade_push_message=trade_push_message,
+        trade_push_orders=trade_push_orders,
+        equity=account["equity"],
+        raw_decisions=raw_decisions,
+        decisions=decisions,
+        orders=orders,
     )
 
 
@@ -500,13 +668,31 @@ def _weight_for_ticker(ticker: str, decisions) -> float | None:
     return None
 
 
-def _latest_buy_dates(*, store, tickers: set[str]) -> dict[str, date]:
-    """Return ticker → most-recent BUY fill date from paper_fills, in ET.
+def _asof_fill_filter(asof: date | None) -> tuple[str, list]:
+    """SQL fragment + params restricting paper_fills to fills on or before the
+    `asof` ET session (`filled_at` is naive ET, so CAST AS DATE is the ET day).
+    Live decide never sees a future fill, so this only bites in replay of a
+    past night, where without it later buys leak into min_hold (live-
+    attribution study 2026-10-01: COIN on 8/24 and 8/25, F/DKNG on 9/4)."""
+    if asof is None:
+        return "", []
+    return " AND CAST(filled_at AS DATE) <= ?", [asof]
 
-    `paper_fills.filled_at` is a naïve UTC TIMESTAMP. A naïve `CAST AS DATE`
-    would mis-attribute a late-day ET fill (e.g. 23:30 ET / 03:30 UTC next
-    day) to the wrong trading day. Convert UTC → America/New_York before
-    truncating, so the date matches the trading session the operator means.
+
+def _latest_buy_dates(
+    *, store, tickers: set[str], asof: date | None = None,
+) -> dict[str, date]:
+    """Return ticker → most-recent BUY fill date from paper_fills, in ET,
+    counting only fills on or before `asof` when it is given.
+
+    `paper_fills.filled_at` is a naïve TIMESTAMP already in ET wall-clock
+    (verified 2026-09-27 against the Alpaca orders endpoint: a fill DuckDB
+    stores as 09:32:29 is 13:32:29Z at the broker -- duckdb's Python client
+    converts a tz-aware datetime, which is what alpaca-py returns for
+    `order.filled_at`/`order.submitted_at`, to this HOST'S local timezone
+    [America/New_York] before storing it into a naive TIMESTAMP column; see
+    `sma.live.reconcile._record_fills`). So a plain `CAST AS DATE` already
+    gives the ET trading day -- no UTC conversion needed or correct here.
 
     Tickers without any BUY fill are absent from the result (caller treats
     that as "no entry date → no min-hold protection"). Used by translate()
@@ -514,25 +700,108 @@ def _latest_buy_dates(*, store, tickers: set[str]) -> dict[str, date]:
     """
     if not tickers:
         return {}
-    # DuckDB: `AT TIME ZONE 'UTC'` interprets a naïve timestamp as UTC,
-    # then `AT TIME ZONE 'America/New_York'` rotates to ET; cast to DATE
-    # gives the ET calendar day.
+    cutoff_sql, cutoff_params = _asof_fill_filter(asof)
     rows = store.conn.execute(
-        """
-        SELECT ticker,
-               MAX(
-                 CAST(
-                   (filled_at AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York'
-                   AS DATE
-                 )
-               )
+        f"""
+        SELECT ticker, MAX(CAST(filled_at AS DATE))
         FROM paper_fills
-        WHERE side = 'BUY' AND ticker = ANY(?) AND filled_shares > 0
+        WHERE side = 'BUY' AND ticker = ANY(?) AND filled_shares > 0{cutoff_sql}
         GROUP BY ticker
         """,
-        [list(tickers)],
+        [list(tickers), *cutoff_params],
     ).fetchall()
     return {r[0]: r[1] for r in rows if r[1] is not None}
+
+
+def _current_holding_entry_dates(
+    *, store, tickers: set[str], asof: date | None = None,
+) -> dict[str, date]:
+    """Return ticker → the ET date the CURRENT continuous holding was FIRST
+    opened: the earliest BUY since the position was last flat (0 shares).
+    With `asof`, only fills on or before the asof ET session count.
+
+    This matches the simulator's peak semantics, where `entry_dates[tkr]` is set
+    at the first buy that opens a position and cleared only when the position
+    fully closes — so the trailing-stop peak window spans the whole current
+    holding and is NOT reset by a later top-up. `_latest_buy_dates` instead
+    returns the MOST-RECENT buy, which after an average-up would restart the
+    peak window late and miss a trailing stop the sim fires.
+
+    Reconstructs the share balance from paper_fills in ET order (BUY adds, SELL
+    subtracts); the streak start is the fill that most recently lifted the
+    running balance from <= 0 to > 0. Tickers with no BUY fills, only NULL
+    fill times, or a net-flat reconstructed history are ABSENT from the result
+    (the caller falls back to a cost_basis-only peak — trailing stays off until
+    a new recorded high, the same conservative fallback as before).
+    """
+    if not tickers:
+        return {}
+    # ET calendar day per fill (filled_at is already naive ET wall-clock,
+    # same convention as _latest_buy_dates -- no conversion). Ordered by the
+    # raw fill timestamp so same-day buy-then-sell sequences reconstruct the
+    # balance in the right order.
+    cutoff_sql, cutoff_params = _asof_fill_filter(asof)
+    rows = store.conn.execute(
+        f"""
+        SELECT ticker,
+               CAST(filled_at AS DATE) AS et_date,
+               side,
+               filled_shares
+        FROM paper_fills
+        WHERE ticker = ANY(?) AND filled_shares > 0 AND filled_at IS NOT NULL{cutoff_sql}
+        ORDER BY ticker, filled_at
+        """,
+        [list(tickers), *cutoff_params],
+    ).fetchall()
+    running: dict[str, float] = {}
+    streak_start: dict[str, date] = {}
+    for ticker, et_date, side, shares in rows:
+        bal = running.get(ticker, 0.0)
+        if side == "BUY":
+            if bal <= 0:
+                streak_start[ticker] = et_date  # opens a fresh continuous holding
+            bal += float(shares)
+        else:  # SELL (or anything non-BUY): reduces the position
+            bal -= float(shares)
+            if bal <= 0:
+                streak_start.pop(ticker, None)  # position closed → streak ends
+                bal = 0.0  # clamp so over-recorded sells don't drift negative
+        running[ticker] = bal
+    return {
+        t: streak_start[t]
+        for t, bal in running.items()
+        if bal > 0 and t in streak_start
+    }
+
+
+def _load_adv_dollars(
+    *, store, universe: list[str], asof: date, lookback: int = 20,
+) -> dict[str, float]:
+    """{ticker: mean(close * volume) over the last `lookback` sessions <= asof}.
+
+    Dollar volume, not share volume: a participation limit is about how much of
+    the day's TRADED VALUE one order represents, and share counts are not
+    comparable across a $24 name and a $1,176 one.
+
+    `<= asof` is correct here (unlike the backtest's strictly-`<` window): decide
+    runs in the evening, after the asof session has closed, so that day's volume
+    is known and excluding it would just make the estimate staler.
+    """
+    rows = store.conn.execute(
+        """
+        SELECT ticker, AVG(close * volume) FROM (
+            SELECT ticker, close, volume,
+                   ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+            FROM prices
+            WHERE ticker = ANY($tickers) AND date <= $asof
+              AND close IS NOT NULL AND volume IS NOT NULL
+        ) t
+        WHERE rn <= $lookback
+        GROUP BY ticker
+        """,
+        {"tickers": list(universe), "asof": asof, "lookback": lookback},
+    ).fetchall()
+    return {t: float(a) for t, a in rows if a is not None}
 
 
 def _load_prices(store, universe: list[str], start: date, end: date) -> pd.DataFrame:

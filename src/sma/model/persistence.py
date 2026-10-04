@@ -7,6 +7,16 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import xgboost as xgb
+from loguru import logger
+
+from sma.model.ensemble import EnsembleModel, ensemble_random_states, ensemble_size
+
+# 2026-08-24 audit: models_artifacts/ has no pruning policy and grows
+# unboundedly — 13+ weekly pickles (~355KB-800KB each) with nothing bounding
+# the count. prune_old_artifacts() keeps this many of the most-recently-
+# created promoted artifacts, plus whichever one is currently serving (never
+# deleted, however old — see prune_old_artifacts).
+DEFAULT_ARTIFACT_KEEP_RECENT = 8
 
 # A retrain is auto-deployed only if its out-of-sample (walk-forward CV) RMSE is
 # no worse than this ratio of the currently-deployed model's. Week-to-week noise
@@ -87,8 +97,31 @@ def write_predictions(
     return len(rows)
 
 
+def _library_versions() -> dict[str, str]:
+    """Versions of the libraries whose numerics determine a model's output.
+
+    Read at save time from the running interpreter — never hard-coded, or the
+    provenance would drift from reality on the first upgrade. Kept to the
+    libraries that actually affect scoring (plus the interpreter itself);
+    a full `pip freeze` would bury the signal.
+    """
+    import platform
+
+    import numpy as _np
+    import pandas as _pd
+    import sklearn as _sklearn
+
+    return {
+        "xgboost": xgb.__version__,
+        "scikit-learn": _sklearn.__version__,
+        "numpy": _np.__version__,
+        "pandas": _pd.__version__,
+        "python": platform.python_version(),
+    }
+
+
 def save_model(
-    model: xgb.XGBRegressor | xgb.XGBRanker,
+    model: xgb.XGBRegressor | xgb.XGBRanker | EnsembleModel,
     *,
     hyperparams: dict,
     feature_names: list[str],
@@ -108,6 +141,12 @@ def save_model(
 ) -> tuple[Path, Path]:
     """Pickle the model + write a JSON metadata sidecar.
 
+    `model` may be a single estimator or an EnsembleModel holding N boosters;
+    an ensemble is ONE pickle like any other artifact, so the file layout,
+    naming, and discovery are unchanged. `ensemble_seeds` /
+    `ensemble_random_states` in the sidecar say how many boosters are inside
+    and which seeds built them.
+
     Returns (pkl_path, json_path). Filenames:
         xgb_<target>_<train_end_date>_<commit_sha8>.pkl
         xgb_<target>_<train_end_date>_<commit_sha8>.json
@@ -115,6 +154,16 @@ def save_model(
     output_dir.mkdir(parents=True, exist_ok=True)
     sha8 = code_commit[:8] if code_commit else "nocommit"
     base = f"xgb_{target}_{train_end_date.isoformat()}_{sha8}"
+    # Uniquify on collision: the Monday retrain and the autoresearch search can
+    # both save the same date at the same commit — the second writer used to
+    # silently OVERWRITE the first (deployed!) artifact (review 2026-07-01).
+    # A "-N" suffix on the sha segment keeps both; latest_model_for_date parses
+    # the date from parts[-2] (unaffected) and breaks same-date ties by
+    # created_at, so the newest promoted model still serves.
+    n = 2
+    while (output_dir / f"{base}.pkl").exists() or (output_dir / f"{base}.json").exists():
+        base = f"xgb_{target}_{train_end_date.isoformat()}_{sha8}-{n}"
+        n += 1
     pkl_path = output_dir / f"{base}.pkl"
     json_path = output_dir / f"{base}.json"
 
@@ -147,7 +196,33 @@ def save_model(
         "promoted": promoted,
         "feature_names": feature_names,
         "hyperparams": hyperparams,
+        # Seed-ensemble provenance (2026-08-24). N boosters live inside the ONE
+        # pickle above; these say how many and which random_states built them,
+        # so a deployed artifact self-describes its ensemble instead of leaving
+        # it to be inferred from the pickle. ABSENT on every artifact written
+        # before this date — a reader must treat "missing" as 1, which is what
+        # ensemble_size() returns for a bare estimator.
+        "ensemble_seeds": ensemble_size(model),
+        "ensemble_random_states": ensemble_random_states(model),
         "code_commit": code_commit,
+        # Library provenance. `code_commit` says which SOURCE produced this
+        # model; this says which LIBRARIES did. Models are persisted with
+        # `pickle.dump`, and an xgboost pickle is not guaranteed to load — or to
+        # score identically — under a different xgboost build, so a deployed
+        # artifact is only as reproducible as the stack that made it. Two
+        # project-specific reasons this is load-bearing:
+        #   1. The pyproject floor was xgboost >=2.0 until 2026-07-30, when it
+        #      was raised to >=3.2 (commit 817a441) to match what actually
+        #      trained the deployed models (3.2.0). Before that raise, a
+        #      resolve that ignored uv.lock could have pulled a different
+        #      MAJOR version and failed to load the deployed .pkl on a live
+        #      book — the floor now matches, but this metadata remains the
+        #      record of what actually built each artifact.
+        #   2. Backtest and live share one code path — "what gets measured is
+        #      what trades". Silent numerical drift from a library upgrade
+        #      breaks that parity; without this there is nothing to diagnose it
+        #      against. (Added 2026-07-30.)
+        "library_versions": _library_versions(),
         "training_duration_seconds": training_duration_seconds,
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
@@ -157,8 +232,16 @@ def save_model(
     return pkl_path, json_path
 
 
-def load_model(pkl_path: Path) -> xgb.XGBRegressor | xgb.XGBRanker:
-    """Unpickle a saved model. Raises FileNotFoundError if missing."""
+def load_model(pkl_path: Path) -> xgb.XGBRegressor | xgb.XGBRanker | EnsembleModel:
+    """Unpickle a saved model. Raises FileNotFoundError if missing.
+
+    Backward compatible by construction: artifacts written before 2026-08-24
+    (the currently promoted one included) pickled a bare estimator, and they
+    still unpickle to exactly that — no shim, no migration, no rewrite. Newer
+    ensemble artifacts unpickle to an EnsembleModel. Callers only ever need
+    `.predict(X)` and the sklearn metadata attributes, which both shapes
+    answer identically.
+    """
     if not pkl_path.exists():
         raise FileNotFoundError(f"Model not found: {pkl_path}")
     with pkl_path.open("rb") as f:
@@ -229,6 +312,74 @@ def latest_model_for_date(
         return tied[0]
     # Latest-created wins; ties on created_at break by filename for determinism.
     return max(tied, key=lambda p: (_model_creation_dt(p), p.name))
+
+
+def prune_old_artifacts(
+    models_dir: Path,
+    asof_date: date,
+    target: str = "ret_30d_forward",
+    keep_recent: int = DEFAULT_ARTIFACT_KEEP_RECENT,
+) -> list[str]:
+    """Delete promoted artifacts beyond a retention window.
+
+    Keeps the union of two sets, never deletes anything else:
+      1. Whichever artifact `latest_model_for_date(models_dir, asof_date,
+         target)` would currently serve — regardless of how old it is. This
+         is the hard constraint: the live/serving model is never pruned.
+      2. The `keep_recent` most-recently-created artifacts (by the same
+         `created_at`-preferred, mtime-fallback ordering `latest_model_for_
+         date` already uses for tie-breaks).
+
+    Only scans `models_dir` directly (glob(), not rglob()) — exactly like
+    `latest_model_for_date` — so `models_dir/"rejected"` (quarantined,
+    non-promoted candidates) is never touched. Each deletion removes the
+    `.pkl` and its `.json` sidecar together. Best-effort per file: an OSError
+    on one delete is logged and skipped, never raised, so a retrain job's
+    pruning step can't fail the job over a locked/already-gone file.
+
+    Returns the model_ids (pkl stems) actually deleted.
+    """
+    if not models_dir.is_dir():
+        return []
+
+    candidates: list[Path] = []
+    for pkl in models_dir.glob(f"xgb_{target}_*.pkl"):
+        parts = pkl.stem.split("_")
+        try:
+            date.fromisoformat(parts[-2])
+        except (ValueError, IndexError):
+            continue
+        candidates.append(pkl)
+
+    if len(candidates) <= keep_recent:
+        return []
+
+    try:
+        serving = latest_model_for_date(models_dir, asof_date, target)
+    except FileNotFoundError:
+        serving = None
+
+    ranked = sorted(candidates, key=lambda p: (_model_creation_dt(p), p.name), reverse=True)
+    keep = set(ranked[:keep_recent])
+    if serving is not None:
+        keep.add(serving)
+
+    deleted: list[str] = []
+    for pkl in candidates:
+        if pkl in keep:
+            continue
+        for f in (pkl, pkl.with_suffix(".json")):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("prune_old_artifacts: could not delete {}: {}", f, exc)
+        deleted.append(pkl.stem)
+
+    if deleted:
+        logger.info(
+            "prune_old_artifacts: deleted {} artifact(s): {}", len(deleted), deleted
+        )
+    return deleted
 
 
 def incumbent_label_type(

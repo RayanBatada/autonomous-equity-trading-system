@@ -1,17 +1,19 @@
 """XGBoostTopK strategy: long the top K tickers by predicted forward return.
 
-Phase 4 Task 11: optional ``use_theses=True`` layers four asymmetric C-rules
+Phase 4 Task 11: optional ``use_theses=True`` layers three asymmetric C-rules
 on top of the Phase 2/3 quant baseline using LLM-generated theses:
 
 1. **Bearish veto.** Drop a buy candidate when the most recent thesis
-   conviction is ``bearish`` or ``strong_bearish``.
+   conviction is ``bearish`` or ``strong_bearish`` (``_apply_thesis_buy_filter``).
 2. **Bullish tilt.** Multiply the quant score by 1.05 when conviction is
-   ``bullish`` or ``strong_bullish``.
-3. **Outside-top-30 override.** Promote a ticker ranked > 30 only if
-   conviction is ``strong_bullish`` AND the thesis carries at least one
-   catalyst flag (see ``OVERRIDE_CATALYST_FLAGS``).
-4. **Strong-bearish exit trigger.** For currently-held tickers, queue a
-   ``thesis_exit`` decision when conviction is ``strong_bearish``.
+   ``bullish`` or ``strong_bullish`` (``_tilt_score``).
+3. **Strong-bearish exit trigger.** Force-sell a currently-held ticker when
+   conviction is ``strong_bearish`` (``_held_exits_on_thesis``).
+
+An outside-top-30 catalyst override was specced as a fourth rule but never
+wired into ``decide``; its helper and the ``OVERRIDE_CATALYST_FLAGS`` set were
+removed in 2026-08 along with ``_thesis_exit_decisions``, a duplicate of
+``_held_exits_on_thesis`` that only tests ever called.
 
 A thesis is considered fresh when its ``asof_date`` falls within the last
 ``THESIS_STALE_DAYS`` (7) calendar days. Stale or missing theses are
@@ -87,15 +89,6 @@ class XGBoostTopKStrategy:
     # --- Phase 4 thesis-integration constants ----------------------------
     THESIS_STALE_DAYS = 7
     BULLISH_TILT_MULT = 1.05
-    OVERRIDE_CATALYST_FLAGS = {
-        "earnings_beat",
-        "guidance_raise",
-        "m&a_announcement",
-        "regulatory_win",
-        "fda_approval",
-        "secular_inflection",
-        "macro_tailwind",
-    }
     BULLISH_CONVICTIONS = {"bullish", "strong_bullish"}
     BEARISH_CONVICTIONS = {"bearish", "strong_bearish"}
 
@@ -109,6 +102,7 @@ class XGBoostTopKStrategy:
         weight_tilt: bool = True,
         weight_tilt_floor_ratio: float = 0.4,
         sector_neutralize: float = 0.0,
+        min_score: float | None = None,
         use_theses: bool = False,
         use_politician_flow: bool = True,
         politician_flow_lookback_days: int = 30,
@@ -158,6 +152,13 @@ class XGBoostTopKStrategy:
         # Sector-relative scoring strength (0 = off / plain top-K). OPT-IN /
         # default-OFF until a backtest on an honest window clears the ship bar.
         self.sector_neutralize = sector_neutralize
+        # Entry conviction floor on the RAW model score (predicted 30d return,
+        # before tilts/demean). None = off. A candidate is only eligible as a
+        # NEW buy when its raw score >= min_score, so weak-signal days hold cash
+        # instead of filling K slots with mediocre names. Held names keep their
+        # rank-hysteresis eligibility regardless (this is an ENTRY gate, not an
+        # exit). OPT-IN / default-OFF until a backtest clears the ship bar.
+        self.min_score = min_score
         self.use_theses = use_theses
         self.use_politician_flow = use_politician_flow
         self.politician_flow_lookback_days = politician_flow_lookback_days
@@ -227,6 +228,17 @@ class XGBoostTopKStrategy:
             thesis = self._recent_thesis(t, asof_date)
             if thesis is None or thesis["conviction"] not in self.BEARISH_CONVICTIONS:
                 out.append(t)
+            else:
+                # 2026-08 study: thesis vetoes were unlogged, costing hours to
+                # reconstruct efficacy after the fact. The vetoed slot is NOT
+                # backfilled from rank K+1 (verified 2026-08-06: `top` is
+                # fixed by top-K selection above before this filter runs), so
+                # the trade count for the day simply shrinks by one.
+                logger.info(
+                    "thesis_veto: {} vetoed on {} thesis, buy slot left unfilled (no backfill)",
+                    t,
+                    thesis["conviction"],
+                )
         return out
 
     def _held_exits_on_thesis(self, ticker: str, asof_date: date) -> bool:
@@ -236,7 +248,16 @@ class XGBoostTopKStrategy:
         if not self.use_theses:
             return False
         thesis = self._recent_thesis(ticker, asof_date)
-        return thesis is not None and thesis["conviction"] == "strong_bearish"
+        exits = thesis is not None and thesis["conviction"] == "strong_bearish"
+        if exits:
+            # The live-fired exit path, called inline from decide(). The 2026-08
+            # study found strategy-level thesis interventions never appeared in
+            # live.decide logs because they were logged on the unused duplicate
+            # (_thesis_exit_decisions, since deleted) instead of this one.
+            logger.info(
+                "thesis_exit: {} exited on {} thesis", ticker, thesis["conviction"]
+            )
+        return exits
 
     def _tilt_score(
         self, ticker: str, base_score: float, asof_date: date
@@ -253,44 +274,6 @@ class XGBoostTopKStrategy:
             # bullish names) — audit xgb_top_k:242.
             return base_score + (self.BULLISH_TILT_MULT - 1.0) * abs(base_score)
         return base_score
-
-    def _thesis_exit_decisions(
-        self, held: set[str], asof_date: date
-    ) -> list[dict]:
-        """Return ``thesis_exit`` decisions for held tickers with strong_bearish convictions."""
-        if not self.use_theses:
-            return []
-        decisions: list[dict] = []
-        for t in held:
-            thesis = self._recent_thesis(t, asof_date)
-            if thesis is None:
-                continue
-            if thesis["conviction"] == "strong_bearish":
-                decisions.append({
-                    "ticker": t,
-                    "action": "thesis_exit",
-                    "reason": thesis["reasoning"] or "strong_bearish thesis",
-                })
-        return decisions
-
-    def _candidates_via_override(
-        self, outside_top_30: list[str], asof_date: date
-    ) -> list[str]:
-        """Return tickers ranked outside top-30 that earn a slot via the
-        strong_bullish + catalyst-flag override."""
-        if not self.use_theses:
-            return []
-        out: list[str] = []
-        for t in outside_top_30:
-            thesis = self._recent_thesis(t, asof_date)
-            if thesis is None:
-                continue
-            if thesis["conviction"] != "strong_bullish":
-                continue
-            if not (set(thesis["flags"]) & self.OVERRIDE_CATALYST_FLAGS):
-                continue
-            out.append(t)
-        return out
 
     # ------------------------------------------------------------------
     # Politician-flow overlay (2026-05-10)
@@ -409,7 +392,23 @@ class XGBoostTopKStrategy:
         held = current_holdings or set()
         keep = [t for t, _ in ranked if t in held and rank_of[t] < self.hold_rank][: self.k]
         n_fill = self.k - len(keep)
-        new_buys = [t for t, _ in ranked if t not in held and rank_of[t] < self.k][:n_fill]
+        new_buy_pool = [t for t, _ in ranked if t not in held and rank_of[t] < self.k]
+        # Entry conviction floor (opt-in): drop new-buy candidates whose RAW
+        # model score is below the bar so a weak-signal day fills fewer slots
+        # (holds cash) rather than buying mediocre names. Uses the untilted
+        # `scores` so the threshold is a plain predicted-return level regardless
+        # of sector-demean scaling. None = no-op. Held names are unaffected.
+        if self.min_score is not None:
+            # Require a FINITE score at/above the floor. A bare `>= min_score`
+            # rejects NaN by accident (NaN comparisons are always False) but lets
+            # a +inf score through — a degenerate model output that must never be
+            # bought. isfinite() rejects both NaN and ±inf explicitly.
+            new_buy_pool = [
+                t for t in new_buy_pool
+                if math.isfinite(scores.get(t, float("-inf")))
+                and scores.get(t, float("-inf")) >= self.min_score
+            ]
+        new_buys = new_buy_pool[:n_fill]
         selected = set(keep) | set(new_buys)
         top = [(t, s) for t, s in ranked if t in selected]
 

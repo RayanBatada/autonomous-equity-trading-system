@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+import requests
 import yaml
 from click.testing import CliRunner
 from finnhub.exceptions import FinnhubAPIException
@@ -112,6 +113,52 @@ def test_backfill_inserts_rows(store):
     )
 
 
+def test_backfill_translates_dash_ticker_to_dot_for_request(store):
+    """BRK-B must be requested from Finnhub in its dot form (BRK.B) -- the
+    same dash-to-dot translation alpaca_prices/alpaca_news/finnhub_news
+    already do for this ticker."""
+    run_id = store.allocate_run_id()
+    store.log_run_start(run_id, source="finnhub_earnings_backfill")
+
+    fake_client = MagicMock()
+    fake_client.company_earnings.return_value = []
+
+    backfill_earnings(
+        api_key="fake", tickers=["BRK-B"], store=store, run_id=run_id,
+        quarters=4, client=fake_client,
+    )
+    fake_client.company_earnings.assert_called_once_with(symbol="BRK.B", limit=4)
+
+
+def test_backfill_stores_brk_a_response_under_canonical_brk_b(store):
+    """Regression (verified live 2026-08-16): Finnhub's company_earnings
+    reports Berkshire under symbol="BRK.A" on BOTH endpoints regardless of
+    query spelling. Before this fix, `symbol = item.get("symbol") or ticker`
+    stored the vendor's response symbol, so all 4 rows landed under ticker
+    'BRK.A' -- a symbol outside the universe (canonical is BRK-B), so
+    nothing downstream ever read them. This call is per-ticker (no batch
+    ambiguity), so the row must always be stored under the canonical
+    `ticker` we requested, never the vendor's response symbol.
+    """
+    run_id = store.allocate_run_id()
+    store.log_run_start(run_id, source="finnhub_earnings_backfill")
+
+    fake_client = MagicMock()
+    fake_client.company_earnings.return_value = [
+        _earnings_item("BRK.A", "2026-05-02", 5.1, 5.4, 2026, 1),
+    ]
+
+    n = backfill_earnings(
+        api_key="fake", tickers=["BRK-B"], store=store, run_id=run_id,
+        quarters=4, client=fake_client,
+    )
+    assert n == 1
+    tickers = {r[0] for r in store.conn.execute(
+        "SELECT ticker FROM earnings"
+    ).fetchall()}
+    assert tickers == {"BRK-B"}
+
+
 def test_backfill_handles_finnhub_exception_per_ticker(store):
     run_id = store.allocate_run_id()
     store.log_run_start(run_id, source="finnhub_earnings_backfill")
@@ -137,6 +184,115 @@ def test_backfill_handles_finnhub_exception_per_ticker(store):
         "SELECT ticker FROM earnings"
     ).fetchall()}
     assert tickers == {"AAPL", "MSFT"}
+
+
+def test_backfill_read_timeout_then_success_retries_and_inserts(store):
+    """The 2026-08-03 backfill hit repeated company_earnings read timeouts
+    (transient Finnhub slowness). One retry must recover the ticker instead
+    of dropping it. Sleep is injected so the test doesn't actually wait.
+    """
+    run_id = store.allocate_run_id()
+    store.log_run_start(run_id, source="finnhub_earnings_backfill")
+
+    calls = {"n": 0}
+
+    def side_effect(symbol, limit):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.exceptions.ReadTimeout("read timed out")
+        return [_earnings_item(symbol, "2026-03-31", 1.0, 1.1)]
+
+    fake_client = MagicMock()
+    fake_client.company_earnings.side_effect = side_effect
+
+    n = backfill_earnings(
+        api_key="fake", tickers=["AAPL"], store=store, run_id=run_id,
+        quarters=8, client=fake_client, sleep_fn=lambda s: None,
+    )
+    assert calls["n"] == 2
+    assert n == 1
+    tickers = {r[0] for r in store.conn.execute(
+        "SELECT ticker FROM earnings"
+    ).fetchall()}
+    assert tickers == {"AAPL"}
+
+
+def test_backfill_read_timeout_twice_gives_up_with_warning(store):
+    """Only ONE retry on a read timeout: two consecutive timeouts give up
+    and the ticker is skipped, but the run continues for other tickers.
+    """
+    run_id = store.allocate_run_id()
+    store.log_run_start(run_id, source="finnhub_earnings_backfill")
+
+    calls = {"n": 0}
+
+    def side_effect(symbol, limit):
+        calls["n"] += 1
+        if symbol == "SLOW":
+            raise requests.exceptions.ReadTimeout("read timed out")
+        return [_earnings_item(symbol, "2026-03-31", 1.0, 1.1)]
+
+    fake_client = MagicMock()
+    fake_client.company_earnings.side_effect = side_effect
+
+    n = backfill_earnings(
+        api_key="fake", tickers=["SLOW", "AAPL"], store=store, run_id=run_id,
+        quarters=8, client=fake_client, sleep_fn=lambda s: None,
+    )
+    # SLOW: initial + 1 retry = 2 calls; AAPL: 1 call.
+    assert calls["n"] == 3
+    assert n == 1
+    tickers = {r[0] for r in store.conn.execute(
+        "SELECT ticker FROM earnings"
+    ).fetchall()}
+    assert tickers == {"AAPL"}
+
+
+def test_backfill_non_timeout_exception_not_retried(store):
+    """A non-timeout exception (e.g. a 429) is not retried -- single call,
+    ticker skipped, matching pre-existing behavior (and what the
+    `--provider both` CLI path relies on for the yfinance gap-fill).
+    """
+    run_id = store.allocate_run_id()
+    store.log_run_start(run_id, source="finnhub_earnings_backfill")
+
+    calls = {"n": 0}
+
+    def side_effect(symbol, limit):
+        calls["n"] += 1
+        raise RuntimeError("connection reset")
+
+    fake_client = MagicMock()
+    fake_client.company_earnings.side_effect = side_effect
+
+    n = backfill_earnings(
+        api_key="fake", tickers=["AAPL"], store=store, run_id=run_id,
+        quarters=8, client=fake_client, sleep_fn=lambda s: None,
+    )
+    assert calls["n"] == 1
+    assert n == 0
+
+
+def test_backfill_raises_client_timeout_to_30s(store, monkeypatch):
+    """The finnhub SDK hardcodes a 10s DEFAULT_TIMEOUT. When backfill_earnings
+    constructs its own client (client=None, the production path), it must
+    raise that to 30s to give real responses room to land.
+    """
+    run_id = store.allocate_run_id()
+    store.log_run_start(run_id, source="finnhub_earnings_backfill")
+
+    fake_client = MagicMock()
+    fake_client.company_earnings.return_value = []
+    monkeypatch.setattr(
+        "sma.ingest.earnings_backfill.finnhub.Client",
+        lambda api_key: fake_client,
+    )
+
+    backfill_earnings(
+        api_key="fake", tickers=["AAPL"], store=store, run_id=run_id,
+        quarters=1,
+    )
+    assert fake_client.DEFAULT_TIMEOUT == 30
 
 
 def test_backfill_idempotent(store):

@@ -18,9 +18,23 @@ from __future__ import annotations
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from sma import schedule as sched
 from sma import watchdog as wd
 from sma.sentinels import write_sentinel
+
+# ---- fixtures ---------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _pin_launchd_adapter(monkeypatch):
+    """Pin the launchd adapter regardless of host OS (CI runs ubuntu-latest,
+    which would otherwise default to SystemdAdapter) -- this suite asserts
+    launchd-specific launchctl argv, per its own docstring above. See
+    sma/sched_adapter.py."""
+    monkeypatch.setenv("SMA_SCHED_ADAPTER", "launchd")
+
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -51,7 +65,7 @@ def _launchctl_mock(state: str, kickstart_rc: int = 0):
 # ---- tests -----------------------------------------------------------------
 
 
-@patch("sma.watchdog.subprocess.run")
+@patch("sma.sched_adapter.subprocess.run")
 def test_watchdog_kickstarts_missed_idle_job(mock_run, tmp_path, monkeypatch):
     """Past deadline + sentinel absent + state 'not running' -> kickstart fired."""
     monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
@@ -61,21 +75,15 @@ def test_watchdog_kickstarts_missed_idle_job(mock_run, tmp_path, monkeypatch):
     rc = wd.check()
 
     # At least one kickstart call for ingest
-    kickstart_calls = [
-        c for c in mock_run.call_args_list if "kickstart" in c.args[0]
-    ]
+    kickstart_calls = [c for c in mock_run.call_args_list if "kickstart" in c.args[0]]
     assert len(kickstart_calls) >= 1, "expected at least one kickstart call"
-    ingest_kicked = any(
-        "com.sma.ingest.daily" in str(c.args[0]) for c in kickstart_calls
-    )
-    assert ingest_kicked, (
-        f"expected com.sma.ingest.daily to be kicked; calls: {kickstart_calls}"
-    )
+    ingest_kicked = any("com.sma.ingest.daily" in str(c.args[0]) for c in kickstart_calls)
+    assert ingest_kicked, f"expected com.sma.ingest.daily to be kicked; calls: {kickstart_calls}"
     # rc is 0 because kickstart succeeded (rc=0 from mock)
     assert rc == 0
 
 
-@patch("sma.watchdog.subprocess.run")
+@patch("sma.sched_adapter.subprocess.run")
 def test_watchdog_no_subprocess_when_sentinel_present(mock_run, tmp_path, monkeypatch):
     """When the ingest sentinel exists the watchdog must not touch launchctl for it."""
     sentinel_dir = tmp_path / "sentinels"
@@ -98,16 +106,13 @@ def test_watchdog_no_subprocess_when_sentinel_present(mock_run, tmp_path, monkey
     wd.check()
 
     # No launchctl call should mention ingest specifically
-    ingest_calls = [
-        c for c in mock_run.call_args_list
-        if "com.sma.ingest.daily" in str(c.args[0])
-    ]
+    ingest_calls = [c for c in mock_run.call_args_list if "com.sma.ingest.daily" in str(c.args[0])]
     assert ingest_calls == [], (
         f"ingest sentinel present; expected 0 launchctl calls for it; got: {ingest_calls}"
     )
 
 
-@patch("sma.watchdog.subprocess.run")
+@patch("sma.sched_adapter.subprocess.run")
 def test_watchdog_skips_running_job(mock_run, tmp_path, monkeypatch):
     """Past deadline + sentinel absent + state 'running' -> no kickstart."""
     monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
@@ -116,15 +121,13 @@ def test_watchdog_skips_running_job(mock_run, tmp_path, monkeypatch):
 
     wd.check()
 
-    kickstart_calls = [
-        c for c in mock_run.call_args_list if "kickstart" in c.args[0]
-    ]
+    kickstart_calls = [c for c in mock_run.call_args_list if "kickstart" in c.args[0]]
     assert kickstart_calls == [], (
         f"job is 'running'; expected no kickstart calls; got: {kickstart_calls}"
     )
 
 
-@patch("sma.watchdog.subprocess.run")
+@patch("sma.sched_adapter.subprocess.run")
 def test_watchdog_skips_waiting_job(mock_run, tmp_path, monkeypatch):
     """Past deadline + sentinel absent + state 'waiting' -> no kickstart."""
     monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
@@ -133,15 +136,13 @@ def test_watchdog_skips_waiting_job(mock_run, tmp_path, monkeypatch):
 
     wd.check()
 
-    kickstart_calls = [
-        c for c in mock_run.call_args_list if "kickstart" in c.args[0]
-    ]
+    kickstart_calls = [c for c in mock_run.call_args_list if "kickstart" in c.args[0]]
     assert kickstart_calls == [], (
         f"job is 'waiting'; expected no kickstart calls; got: {kickstart_calls}"
     )
 
 
-@patch("sma.watchdog.subprocess.run")
+@patch("sma.sched_adapter.subprocess.run")
 def test_watchdog_returns_nonzero_on_kickstart_failure(mock_run, tmp_path, monkeypatch):
     """If launchctl kickstart returns non-zero, watchdog returns 1."""
     monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
@@ -152,7 +153,7 @@ def test_watchdog_returns_nonzero_on_kickstart_failure(mock_run, tmp_path, monke
     assert rc == 1, "expected rc=1 when kickstart fails"
 
 
-@patch("sma.watchdog.subprocess.run")
+@patch("sma.sched_adapter.subprocess.run")
 def test_watchdog_does_not_fire_before_deadline(mock_run, tmp_path, monkeypatch):
     """Before the ingest deadline, no launchctl calls for ingest."""
     monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
@@ -160,16 +161,13 @@ def test_watchdog_does_not_fire_before_deadline(mock_run, tmp_path, monkeypatch)
 
     wd.check()
 
-    ingest_calls = [
-        c for c in mock_run.call_args_list
-        if "com.sma.ingest.daily" in str(c.args[0])
-    ]
+    ingest_calls = [c for c in mock_run.call_args_list if "com.sma.ingest.daily" in str(c.args[0])]
     assert ingest_calls == [], (
         f"before ingest deadline; expected 0 launchctl calls for it; got: {ingest_calls}"
     )
 
 
-@patch("sma.watchdog.subprocess.run")
+@patch("sma.sched_adapter.subprocess.run")
 def test_watchdog_print_precedes_kickstart(mock_run, tmp_path, monkeypatch):
     """launchctl print must be called before kickstart for each missed job.
 

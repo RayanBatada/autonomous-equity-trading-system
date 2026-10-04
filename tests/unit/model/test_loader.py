@@ -1,11 +1,13 @@
 """Tests for build_training_set in sma.model.loader."""
 
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from sma.features.builder import FEATURE_NAMES
+from sma.ingest.universe import load_training_membership
 from sma.model.loader import _compute_politician_flows, build_training_set
 
 # ---------------------------------------------------------------------------
@@ -309,3 +311,206 @@ def test_compute_latest_surprises_resolves_most_recent_clamped():
     assert s["AAA"] == pytest.approx(-0.5)   # April report (latest <= asof), not January
     assert "BBB" not in s                     # never reported an actual
     assert s["CCC"] == 1.0                    # clamped at +100%
+
+
+def test_earnings_loader_feeds_surprises_end_to_end(tmp_path):
+    """2026-07-01 HIGH (train/serve skew): _load_earnings_calendar selected only
+    (ticker, report_date), so _compute_latest_surprises — which defensively
+    returns {} without the eps columns — silently trained
+    earnings_surprise_last as a constant 0.0 while predict served real values.
+    Pin the full chain: DB -> loader -> non-zero surprises."""
+    from datetime import date
+
+    import duckdb
+
+    from sma.model.__main__ import _load_earnings_calendar
+    from sma.model.loader import _compute_latest_surprises
+
+    db = tmp_path / "t.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        "CREATE TABLE earnings (ticker VARCHAR, report_date DATE, "
+        "eps_estimate DOUBLE, eps_actual DOUBLE, revenue_estimate DOUBLE, "
+        "revenue_actual DOUBLE, source VARCHAR, run_id BIGINT)"
+    )
+    con.execute(
+        "INSERT INTO earnings VALUES "
+        "('AAPL', DATE '2026-04-30', 2.00, 2.20, NULL, NULL, 't', 1), "
+        "('MSFT', DATE '2026-05-01', 3.00, 2.70, NULL, NULL, 't', 1)"
+    )
+    con.close()
+
+    df = _load_earnings_calendar(db)
+    assert {"eps_estimate", "eps_actual"}.issubset(df.columns), (
+        "loader must carry the eps columns or surprises silently die"
+    )
+    s = _compute_latest_surprises(df, date(2026, 6, 1))
+    assert abs(s["AAPL"] - 0.10) < 1e-9   # (2.20-2.00)/2.00
+    assert abs(s["MSFT"] - (-0.10)) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# PIT membership (survivorship fix, 2026-07-20): rows for a former universe
+# member are capped to its membership interval; unrestricted tickers unchanged.
+# ---------------------------------------------------------------------------
+
+def test_build_training_set_membership_caps_former_member_rows():
+    tickers = ["AAA", "BBB"]
+    prices = _multi_ticker_prices(["SPY", *tickers], n_days=340)  # SPY: rel_strength feature
+    all_dates = sorted(prices["date"].unique())
+    train_start = all_dates[255]
+    train_end = all_dates[-(30 + 5)]
+    removed = all_dates[275]  # BBB leaves the universe mid-window
+
+    x, y, asofs = build_training_set(
+        prices, tickers,
+        train_start=train_start, train_end=train_end,
+        forward_horizon_days=30,
+        membership={"BBB": (None, removed)},
+    )
+    counts = asofs.value_counts()
+    before = [d for d in counts.index if d < removed]
+    after = [d for d in counts.index if d >= removed]
+    assert before and after
+    assert all(counts[d] == 2 for d in before), "both tickers before removal"
+    assert all(counts[d] == 1 for d in after), "only AAA after BBB's removal"
+
+
+def test_build_training_set_membership_respects_added_date():
+    tickers = ["AAA", "CCC"]
+    prices = _multi_ticker_prices(["SPY", *tickers], n_days=340)
+    all_dates = sorted(prices["date"].unique())
+    train_start = all_dates[255]
+    train_end = all_dates[-(30 + 5)]
+    added = all_dates[275]  # CCC joins mid-window
+
+    _x, _y, asofs = build_training_set(
+        prices, tickers,
+        train_start=train_start, train_end=train_end,
+        forward_horizon_days=30,
+        membership={"CCC": (added, None)},
+    )
+    counts = asofs.value_counts()
+    assert all(counts[d] == 1 for d in counts.index if d < added)
+    assert all(counts[d] == 2 for d in counts.index if d >= added)
+
+
+def test_build_training_set_membership_none_is_unchanged():
+    tickers = ["AAA", "BBB"]
+    prices = _multi_ticker_prices(["SPY", *tickers], n_days=320)
+    all_dates = sorted(prices["date"].unique())
+    train_start = all_dates[255]
+    train_end = all_dates[-(30 + 5)]
+
+    x_none, y_none, a_none = build_training_set(
+        prices, tickers, train_start=train_start, train_end=train_end,
+        forward_horizon_days=30,
+    )
+    x_empty, y_empty, a_empty = build_training_set(
+        prices, tickers, train_start=train_start, train_end=train_end,
+        forward_horizon_days=30, membership={},
+    )
+    assert len(x_none) == len(x_empty) and (y_none.values == y_empty.values).all()
+
+
+# ---------------------------------------------------------------------------
+# AVB/EA delisting fix (2026-09-01): universe_history.yaml's `members:` now
+# carries a real `removed` date for these two real corporate actions -- AVB
+# merged into Vivmark Residential (NYSE halt/delisting 2026-08-17, real last
+# trade 2026-08-14) and EA went private in a $55B LBO (delisted from Nasdaq
+# 2026-08-04, real last trade 2026-08-04). See
+# scripts/verify_avb_ea_delisting.py for the last-trade-day evidence. Prove
+# the ACTUAL shipped file's dates correctly gate build_training_set -- not a
+# synthetic stand-in for them.
+# ---------------------------------------------------------------------------
+
+def test_build_training_set_avb_ea_removed_after_real_delisting():
+    hist_path = (
+        Path(__file__).resolve().parents[3] / "src" / "sma" / "universe_history.yaml"
+    )
+    membership = load_training_membership(hist_path)
+    avb_removed = membership["AVB"][1]
+    ea_removed = membership["EA"][1]
+    # Pin the real corporate-action dates: a future regen or hand-edit typo in
+    # universe_history.yaml fails loud here, not silently in live training.
+    assert avb_removed == date(2026, 8, 15)  # day after AVB's last trade 2026-08-14
+    assert ea_removed == date(2026, 8, 5)    # day after EA's last trade 2026-08-04
+
+    tickers = ["AVB", "EA"]
+    start = date(2025, 9, 1)
+    prices = _multi_ticker_prices(["SPY", *tickers], n_days=420, start=start)
+    train_start = ea_removed - timedelta(days=30)
+    train_end = avb_removed + timedelta(days=15)
+
+    _x, _y, asofs = build_training_set(
+        prices, tickers,
+        train_start=train_start, train_end=train_end,
+        forward_horizon_days=30,
+        membership={"AVB": (None, avb_removed), "EA": (None, ea_removed)},
+    )
+    counts = asofs.value_counts()
+    both = [d for d in counts.index if d < ea_removed]
+    avb_only = [d for d in counts.index if ea_removed <= d < avb_removed]
+    neither = [d for d in counts.index if d >= avb_removed]
+    assert both and avb_only, "expected rows on both sides of EA's removal boundary"
+    assert all(counts[d] == 2 for d in both), "both tickers present before EA leaves"
+    assert all(counts[d] == 1 for d in avb_only), "only AVB present after EA leaves"
+    assert not neither, f"rows still generated on/after AVB's removal: {neither}"
+
+
+# ---------------------------------------------------------------------------
+# Per-ticker price frames are now grouped and sorted ONCE, above the
+# (asof x ticker) loop, instead of re-masking and re-sorting the whole frame
+# per label (2026-08-17). Labels must be identical, and a ticker whose price
+# rows stop early must still drop out of the dates it cannot be labelled on.
+# ---------------------------------------------------------------------------
+
+def test_build_training_set_drops_dates_where_forward_rows_are_missing():
+    tickers = ["AAA", "BBB"]
+    prices = _multi_ticker_prices(["SPY", *tickers], n_days=340)
+    all_dates = sorted(prices["date"].unique())
+    # BBB's data stops early: it can still be labelled while its entry AND
+    # exit rows exist, and must vanish from every later asof.
+    cutoff = all_dates[300]
+    prices = prices[(prices["ticker"] != "BBB") | (prices["date"] <= cutoff)]
+
+    train_start = all_dates[255]
+    train_end = all_dates[-(30 + 5)]
+    _x, _y, asofs = build_training_set(
+        prices, tickers,
+        train_start=train_start, train_end=train_end, forward_horizon_days=30,
+    )
+    counts = asofs.value_counts()
+    last_labelable = all_dates[300 - 30]
+    assert counts[all_dates[260]] == 2, "both tickers early in the window"
+    assert all(
+        counts[d] == 1 for d in counts.index if d > last_labelable
+    ), "BBB must drop out once its forward exit row no longer exists"
+
+
+def test_build_training_set_labels_match_a_manual_per_ticker_computation():
+    """Guards the grouped/sorted frame reuse: the label is still (adjusted
+    forward close / adjusted next open) - 1 off THAT ticker's own rows."""
+    tickers = ["AAA", "BBB"]
+    prices = _multi_ticker_prices(["SPY", *tickers], n_days=330)
+    all_dates = sorted(prices["date"].unique())
+    train_start = all_dates[280]
+    train_end = all_dates[282]
+
+    x, y, asofs = build_training_set(
+        prices, tickers,
+        train_start=train_start, train_end=train_end, forward_horizon_days=30,
+    )
+    assert len(x) > 0
+    for i, asof in enumerate(asofs):
+        idx = all_dates.index(asof)
+        entry_date, future_date = all_dates[idx + 1], all_dates[idx + 30]
+        # Recompute from the raw frame the slow way, per ticker.
+        expected = []
+        for t in tickers:
+            tp = prices[prices["ticker"] == t]
+            er = tp[tp["date"] == entry_date].iloc[0]
+            fr = tp[tp["date"] == future_date].iloc[0]
+            entry_px = float(er["open"]) * float(er["adj_close"]) / float(er["close"])
+            expected.append((float(fr["adj_close"]) / entry_px) - 1.0)
+        assert any(abs(y.iloc[i] - e) < 1e-12 for e in expected)

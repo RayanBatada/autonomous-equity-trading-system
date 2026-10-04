@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import difflib
 import sys
+from datetime import date as date_cls
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -63,6 +65,35 @@ def run_cmd(iterations: int, db: str) -> None:
             store.conn.close()
 
 
+# Trading-day guard (2026-08-24): on Mon 2026-08-17, autoresearch (fires
+# 07:00 ET, config search over ~6 configs x 5-fold walk-forward CV) finished
+# at 09:22 — two minutes past the 09:20 ET boundary the live stop-loss sweep
+# needs the writer lock free by. That morning's 09:25 stop-loss sweep never
+# logged at all. 1ee39b1 (feature-build O(N^2) fix, landed later that same
+# evening) cut the next Monday's (2026-08-24) run to 56 minutes — a
+# comfortable margin — but recent Mondays have ranged 56min-7h depending on
+# config count/data volume, so one fast post-fix run doesn't retire the risk.
+# Mirrors sma.agents.__main__._deadline_reached's shape: a same-day-only ET
+# cutoff, checked cooperatively (here, at config-search granularity via
+# config_search.search_configs' `deadline_reached` callback) rather than a
+# hard kill, so a run either finishes clean or checkpoints a partial,
+# still-reviewable result instead of silently blocking the trading day.
+_AUTORESEARCH_TRADING_DAY_CUTOFF_HOUR_MINUTE_ET = (8, 45)
+
+
+def _search_deadline_reached(*, now_et: datetime, asof: date_cls) -> bool:
+    """True once the scheduled SAME-DAY search must stop starting new configs.
+
+    Historical/manual asofs (a backtest or --no-require-retrain manual run
+    against an old date) stay unbudgeted — `asof` must equal `now_et`'s date,
+    matching agents._deadline_reached's "SCHEDULED same-day run only" rule.
+    """
+    if asof != now_et.date():
+        return False
+    cutoff_hour, cutoff_minute = _AUTORESEARCH_TRADING_DAY_CUTOFF_HOUR_MINUTE_ET
+    return (now_et.hour, now_et.minute) >= (cutoff_hour, cutoff_minute)
+
+
 @cli.command("search")
 @click.option("--asof", type=click.DateTime(formats=["%Y-%m-%d"]), default=None,
               help="As-of date; defaults to today (ET) so the plist can omit it.")
@@ -85,8 +116,15 @@ def run_cmd(iterations: int, db: str) -> None:
 @click.option("--dry-run", is_flag=True, default=False,
               help="Search + decide but never train/save a model (still writes a "
                    "sentinel). Use to inspect what it would promote.")
+@click.option("--require-retrain/--no-require-retrain", default=True,
+              help="Defer (exit 0, no work, no sentinel) unless the weekly retrain "
+                   "has written its sentinel for the as-of date. Default on: the "
+                   "search must evaluate against the freshly-trained model, and "
+                   "the 07:00 launchd fire must not burn its 2h heavy-lock wait "
+                   "racing a retrain that ran long (Mac asleep at 04:00). Use "
+                   "--no-require-retrain for manual/backfill runs.")
 def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
-               objective, dry_run):
+               objective, dry_run, require_retrain):
     """Search the training-config space for the best held-out CV rank-IC and
     auto-promote the winner through the IC gate (same autonomy as the weekly
     retrain). Replaces the old tilt()-rewriting loop, which optimized a
@@ -109,6 +147,8 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
         _load_news_for_count_feature,
         _load_politician_trades,
         _load_prices_for_range,
+        _resolve_ensemble_seeds,
+        _resolve_feature_workers,
         _train_default_start,
     )
     from sma.model.loader import build_training_set
@@ -121,6 +161,50 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
         asof.date() if asof
         else datetime.now(ZoneInfo("America/New_York")).date()
     )
+
+    # 2026-08-24 gap-fix: 885bf98 added the weekly retrain's 10-seed prediction
+    # ensemble but left autoresearch training its final fit at the default
+    # single seed and saving into the SAME models_dir — latest_model_for_date
+    # breaks same-date ties by created_at, so a promotion here would silently
+    # replace a 10-seed ensemble artifact with a single-seed model. No new CLI
+    # flag: autoresearch always follows model.ensemble_seeds from config.yaml
+    # (the same knob the scheduled 04:00 retrain reads via this same
+    # resolver), so the two jobs can never disagree about what "the model" is.
+    n_ensemble = _resolve_ensemble_seeds(None)
+    logger.info(
+        "autoresearch search: ensemble_seeds={} (from config.yaml model.ensemble_seeds)"
+        + (" — gate and final fit score the ensemble MEAN." if n_ensemble > 1 else ""),
+        n_ensemble,
+    )
+
+    # Autoresearch MUST run AFTER the weekly retrain: it evaluates configs against
+    # the freshly-trained model, and racing the retrain for the heavy_job_lock
+    # both (a) blocks the full 2h lock-wait when the retrain runs long and (b)
+    # inverts artifact precedence (the 2026-06-19 bug). The watchdog already gates
+    # its re-kick on the retrain sentinel, but the 07:00 launchd fire does NOT —
+    # so on a Mac that slept through the 04:00 retrain (which then ran mid-
+    # afternoon/evening holding the lock), autoresearch fired at 07:00, blocked
+    # the entire heavy-lock timeout, and died exit-1 with a cry-wolf "missed job"
+    # page EVERY Monday (2026-07-13/20/27). Defer cleanly here instead. Writing NO
+    # sentinel is deliberate: the watchdog still sees autoresearch as not-done and
+    # re-kicks it once the retrain sentinel lands (within its late-kick window).
+    if require_retrain:
+        from sma.sentinels import read_sentinel
+
+        retrain_label = "com.sma.model.retrain.weekly"
+        if read_sentinel(label=retrain_label, asof=asof_date) is None:
+            logger.info(
+                "autoresearch: {} sentinel for {} is absent; deferring — the "
+                "watchdog re-kicks once retrain completes (pass --no-require-retrain "
+                "to run anyway).",
+                retrain_label, asof_date,
+            )
+            click.echo(
+                f"search: deferred — no {retrain_label} sentinel for {asof_date} "
+                "yet; the watchdog re-kicks once retrain completes"
+            )
+            return
+
     label_type = "raw" if raw_labels else "demean"
     # Default the seed to the as-of date's ordinal so a weekly schedule explores
     # a fresh set of configs each run (reproducible given the date) rather than
@@ -132,6 +216,16 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
     logger.info(
         "autoresearch search: asof={} n_configs={} seed={} label={} dry_run={}",
         asof_date, n_configs, seed, label_type, dry_run,
+    )
+
+    # Same knob, same resolver as the weekly retrain: the config search rebuilds
+    # the FULL training set before it evaluates a single config, so it pays the
+    # feature build in full and gets the same fan-out. No CLI flag, for the same
+    # reason ensemble_seeds has none here — the two jobs must never disagree.
+    n_feature_workers = _resolve_feature_workers(None)
+    logger.info(
+        "autoresearch search: feature_workers={} (from config.yaml "
+        "model.feature_workers)", n_feature_workers,
     )
 
     prices = _load_prices_for_range(Path(db), universe, train_start, asof_date)
@@ -150,6 +244,7 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
             politician_trades=_load_politician_trades(Path(db)),
             earnings=_load_earnings_calendar(Path(db)),
             news=_load_news_for_count_feature(Path(db)),
+            feature_workers=n_feature_workers,
         )
     if X.empty:
         click.echo("No training data; aborting.", err=True)
@@ -164,6 +259,24 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
             models_dir=models_dir, asof_date=asof_date, train_start=train_start,
             label_type=label_type, target=DEFAULT_TARGET, objective=objective,
             n_configs=n_configs, seed=seed,
+            # --raw-labels is a deliberate manual request: force=True runs the
+            # full search even if it's known upfront to defer on label
+            # mismatch. The default (unflagged/scheduled) path does NOT force,
+            # so a run whose label_type happens to mismatch the incumbent
+            # skips the expensive CV instead of burning it on a guaranteed
+            # HOLD (2026-07-01 review).
+            force=raw_labels,
+            # search_configs' own n_configs x n_folds sweep stays single-seed
+            # regardless (cost guard); select_and_gate honors this only for the
+            # chosen winner's gate re-measurement and the incumbent comparison.
+            ensemble_seeds=n_ensemble,
+            # Trading-day guard (2026-08-24) — see _search_deadline_reached.
+            # Re-checks wall-clock ET on every call, not a snapshot taken once
+            # at the top of this command: the whole point is to catch time
+            # actually elapsing during the search.
+            deadline_reached=lambda: _search_deadline_reached(
+                now_et=datetime.now(ZoneInfo("America/New_York")), asof=asof_date,
+            ),
         )
         best = outcome.best
         promote = bool(outcome.decision.promote and not dry_run)
@@ -171,8 +284,13 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
         if promote:
             params = {**DEFAULT_HYPERPARAMS, **best.params}
             t0 = time.perf_counter()
+            # The FINAL fit must match what the gate above was actually
+            # measured on — an ensemble artifact backed by ensemble-consistent
+            # cv_ic/cv_rmse, not a single-seed model saved under an ensemble's
+            # gate numbers (2026-08-24 gap-fix).
             model = train_xgb(
                 X, y, hyperparams=params, asof_dates=asof_dates, objective=objective,
+                ensemble_seeds=n_ensemble,
             )
             train_dur = time.perf_counter() - t0
             preds = model.predict(X)
@@ -182,7 +300,10 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
             # incumbent RMSE and silently disable the next retrain's RMSE gate
             # (Codex review 2026-06-17). One extra CV pass for the winner only.
             try:
-                cv_rmse = walk_forward_cv_rmse(X, y, asof_dates, params, objective=objective)
+                cv_rmse = walk_forward_cv_rmse(
+                    X, y, asof_dates, params, objective=objective,
+                    ensemble_seeds=n_ensemble,
+                )
             except Exception as e:  # noqa: BLE001 - never let this abort a promote
                 logger.warning("search: winner cv_rmse computation failed: {}", e)
                 cv_rmse = float("nan")
@@ -194,7 +315,15 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
                 train_rows=len(X),
                 train_rmse=train_rmse,
                 cv_rmse=cv_rmse,
-                cv_ic=best.cv_ic,
+                # The ensemble-consistent gate number (SearchOutcome's
+                # apples-to-apples comparison against the incumbent), not
+                # best.cv_ic (the single-seed search-stage ranking score) —
+                # falls back to best.cv_ic only when a caller's outcome never
+                # populated promoted_cv_ic (ensemble_seeds=1: identical value).
+                cv_ic=(
+                    outcome.promoted_cv_ic
+                    if outcome.promoted_cv_ic is not None else best.cv_ic
+                ),
                 code_commit=_current_git_sha(),
                 training_duration_seconds=train_dur,
                 output_dir=models_dir,
@@ -222,7 +351,12 @@ def search_cmd(asof, n_configs, seed, db, models_dir, universe_path, raw_labels,
                 "promoted": promote,
                 "reason": outcome.decision.reason,
                 "best_cv_ic": best.cv_ic,
+                # The ensemble-consistent number the gate actually compared
+                # (== best_cv_ic when ensemble_seeds == 1; see
+                # SearchOutcome.promoted_cv_ic).
+                "gate_cv_ic": outcome.promoted_cv_ic,
                 "incumbent_cv_ic": outcome.incumbent_cv_ic,
+                "ensemble_seeds": n_ensemble,
                 "best_params": best.params,
                 "n_configs": outcome.n_configs_evaluated,
                 # EVERY evaluated config (best-first) — the counterfactual record

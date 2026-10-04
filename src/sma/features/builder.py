@@ -14,10 +14,13 @@ incorporates the new feature.
 """
 
 from datetime import date
+from typing import NamedTuple
 
 import pandas as pd
 
 from sma.features import technical
+from sma.features.parallel import contiguous_chunks, map_ordered, resolve_workers
+from sma.features.window import PriceWindow, SortedPrices
 
 FEATURE_NAMES: list[str] = [
     "ret_1d", "ret_5d", "ret_20d", "ret_60d",
@@ -72,83 +75,89 @@ FEATURE_NAMES: list[str] = [
 ]
 
 
-def build_features(
-    prices: pd.DataFrame,
-    universe: list[str],
-    asof_date: date,
-    politician_flows: dict[str, float] | None = None,
-    earnings_calendar: dict[str, date] | None = None,
-    earnings_surprises: dict[str, float] | None = None,
-    news_counts_7d: dict[str, int] | None = None,
-) -> pd.DataFrame:
-    """For each ticker in universe, compute the 16 features as of asof_date.
+# More chunks than workers so the tail stays balanced: tickers differ in how
+# much price history they carry (a name delisted mid-window has a third of the
+# rows of a full-history name), so equal-sized chunks are NOT equal-cost.
+# Handing out 4 small chunks per worker instead of 1 big one lets a worker that
+# drew cheap names pick up more.
+_TICKER_CHUNKS_PER_WORKER = 4
 
-    Args:
-        prices: multi-ticker price DataFrame with columns
-            ticker, date, open, high, low, close, adj_close, volume.
-            Must include SPY rows so rel_strength_spy_60d can resolve.
-        universe: tickers to score. SPY itself is included if it's in the list.
-        asof_date: date at which to evaluate the features.
-        politician_flows: optional ticker → net 30d politician dollar flow.
-        earnings_calendar: optional ticker → next earnings report_date AFTER
-            asof_date. When None or ticker absent, days_to_next_earnings
-            defaults to 60 (the cap — i.e. "no earnings soon").
-        news_counts_7d: optional ticker → news article count over [asof-7d, asof].
-            When None or ticker absent, news_count_7d_log defaults to 0
-            (log1p(0) = 0 — no news attention signal).
 
-    Returns:
-        DataFrame indexed by ticker with FEATURE_NAMES as columns. Tickers
-        for which any feature is None (insufficient history) are DROPPED, not
-        emitted with NaN. The training loader handles missing-row exclusion.
+class _AsofContext(NamedTuple):
+    """Everything a feature row needs beyond its own ticker symbol.
+
+    Assembled ONCE per asof_date by build_features and thereafter read-only.
+    Bundling it is what lets the parallel path ship the heavy inputs to each
+    worker a single time (via the pool initializer) instead of attaching them
+    to every ticker chunk.
+
+    `sectors` / `sector_etf_for_gics` are passed in rather than re-imported in
+    the worker deliberately: a spawned child would import sma.sectors fresh and
+    miss any patch the caller applied, so passing the mappings keeps the
+    parallel path faithful to whatever the parent actually read.
+
+    The price inputs are PriceWindows, not frames: already truncated to
+    date <= asof_date and sorted, once each, before anything reads them. That
+    is what stops the ~22 feature functions from each redoing the mask and the
+    sort. It also SHRINKS what the parallel path ships — a worker gets each
+    ticker's visible history, not its whole history.
     """
-    # Local import to avoid circular dep when sma.sectors is loaded first.
-    from sma.sectors import SECTOR_ETF_FOR_GICS, SECTORS
 
-    spy_prices = prices[prices["ticker"] == "SPY"]
-    # Pre-extract sector-ETF price slices once so the per-ticker loop
-    # doesn't re-filter the full prices DataFrame N times.
-    sector_etf_prices: dict[str, pd.DataFrame] = {}
-    for etf in set(SECTOR_ETF_FOR_GICS.values()):
-        slice_ = prices[prices["ticker"] == etf]
-        if not slice_.empty:
-            sector_etf_prices[etf] = slice_
+    asof_date: date
+    windows_by_ticker: dict[str, PriceWindow]
+    spy_window: PriceWindow
+    sector_etf_windows: dict[str, PriceWindow]
+    ret_30d_by_ticker: dict[str, float | None]
+    sector_members: dict[str, list[str]]
+    sectors: dict[str, str]
+    sector_etf_for_gics: dict[str, str]
+    politician_flows: dict[str, float] | None
+    earnings_calendar: dict[str, date] | None
+    earnings_surprises: dict[str, float] | None
+    news_counts_7d: dict[str, int] | None
 
-    # Pre-group prices by ticker once so the per-ticker loop doesn't
-    # re-scan the full DataFrame N times. Also pre-group by sector so the
-    # sector-relative-strength lookup is O(1) instead of O(universe).
-    prices_by_ticker = {t: prices[prices["ticker"] == t] for t in universe}
-    sector_members: dict[str, list[str]] = {}
-    for t in universe:
-        sec = SECTORS.get(t)
-        # ETFs are benchmarks, not within-sector members: SPY/NANC ("ETF") and
-        # the SPDR sector ETFs ("Sector ETF", e.g. XLK/XLE) have no meaningful
-        # GICS-sector peer group, so they neither form nor join peer buckets.
-        if sec is None or sec in ("ETF", "Sector ETF"):
-            continue
-        sector_members.setdefault(sec, []).append(t)
 
+def _feature_rows_for_tickers(
+    tickers: list[str], ctx: _AsofContext,
+) -> list[dict]:
+    """Compute one feature dict per ticker, in `tickers` order.
+
+    This is the whole per-ticker body of build_features, lifted out verbatim so
+    that the serial path and each parallel worker run the SAME code over
+    different slices of the universe. Tickers with no price rows, or with any
+    feature that comes back None, are dropped — the caller's row list is not
+    parallel to `tickers`.
+
+    Must stay a module-level function: `spawn` pickles the task by qualified
+    name, so a closure or a local def would not survive the trip to a worker.
+    """
+    asof_date = ctx.asof_date
     rows: list[dict] = []
-    for ticker in universe:
-        target_prices = prices_by_ticker.get(ticker)
-        if target_prices is None or target_prices.empty:
+    for ticker in tickers:
+        # One window per ticker, built once by build_features and read ~22
+        # times below. Absent = the ticker has no price rows at all; empty =
+        # it has rows but none at or before asof_date, which every feature
+        # would have resolved to None anyway (and the None sweep at the bottom
+        # of the loop would then have dropped the row).
+        target_prices = ctx.windows_by_ticker.get(ticker)
+        if target_prices is None or target_prices.rows.empty:
             continue
 
         # Sector peers (excluding self). Default to 0.0 when peers are
         # absent or insufficient — letting the model learn that "no
         # within-sector signal" maps to neutral.
-        sec = SECTORS.get(ticker)
+        sec = ctx.sectors.get(ticker)
         if sec is None or sec in ("ETF", "Sector ETF"):
             sector_rs: float | None = 0.0
         else:
-            peers = [t for t in sector_members.get(sec, []) if t != ticker]
-            peer_prices = [
-                prices_by_ticker[t] for t in peers
-                if prices_by_ticker.get(t) is not None
-                and not prices_by_ticker[t].empty
-            ]
-            sector_rs = technical.rel_strength_sector_30d(
-                target_prices, peer_prices, asof_date,
+            # Peers keep universe order — see the bit-identical note on
+            # rel_strength_sector_30d_from_returns. A peer with no price rows
+            # is absent from the map and yields None, exactly as the old path
+            # dropped it from the frame list before computing.
+            peers = [t for t in ctx.sector_members.get(sec, []) if t != ticker]
+            sector_rs = technical.rel_strength_sector_30d_from_returns(
+                ctx.ret_30d_by_ticker.get(ticker),
+                [ctx.ret_30d_by_ticker.get(t) for t in peers],
             )
             if sector_rs is None:
                 sector_rs = 0.0  # insufficient peers — neutral
@@ -156,11 +165,11 @@ def build_features(
         # Sector ETF relative strength. Independent of peer membership —
         # benchmarks against an actual tradable index (XLK, XLF, etc.).
         sector_etf_ticker = (
-            SECTOR_ETF_FOR_GICS.get(sec) if sec else None
+            ctx.sector_etf_for_gics.get(sec) if sec else None
         )
-        if sector_etf_ticker and sector_etf_ticker in sector_etf_prices:
+        if sector_etf_ticker and sector_etf_ticker in ctx.sector_etf_windows:
             etf_rs = technical.rel_strength_sector_etf_30d(
-                target_prices, sector_etf_prices[sector_etf_ticker], asof_date,
+                target_prices, ctx.sector_etf_windows[sector_etf_ticker], asof_date,
             )
             if etf_rs is None:
                 etf_rs = 0.0
@@ -178,7 +187,7 @@ def build_features(
             "volume_z_20d": technical.volume_z_20d(target_prices, asof_date),
             "dollar_volume_20d": technical.dollar_volume_20d(target_prices, asof_date),
             "rel_strength_spy_60d": technical.rel_strength_spy_60d(
-                target_prices, spy_prices, asof_date
+                target_prices, ctx.spy_window, asof_date
             ),
             "gap_open": technical.gap_open(target_prices, asof_date),
             "dist_from_52w_high": technical.dist_from_52w_high(target_prices, asof_date),
@@ -186,27 +195,27 @@ def build_features(
             # crash-asymmetry, and vol-scaled short-term reversal — trend
             # QUALITY transforms of price data already on hand.
             "vol_adj_mom_60d": technical.vol_adj_mom_60d(
-                target_prices, spy_prices, asof_date
+                target_prices, ctx.spy_window, asof_date
             ),
             "downside_vol_ratio_60d": technical.downside_vol_ratio_60d(
                 target_prices, asof_date
             ),
             "reversal_5d_z": technical.reversal_5d_z(target_prices, asof_date),
             "earnings_surprise_last": float(
-                (earnings_surprises or {}).get(ticker, 0.0)
+                (ctx.earnings_surprises or {}).get(ticker, 0.0)
             ),
             # 2026-05-10: net House-PTR dollar flow over the prior 30
             # days. 0.0 when the caller didn't supply flow data or no
             # politician trades touched this ticker in the window.
             "politician_flow_30d": (
-                float(politician_flows.get(ticker, 0.0))
-                if politician_flows is not None else 0.0
+                float(ctx.politician_flows.get(ticker, 0.0))
+                if ctx.politician_flows is not None else 0.0
             ),
             "rel_strength_sector_30d": sector_rs,
             "days_to_next_earnings": _days_to_next_earnings(
-                ticker, asof_date, earnings_calendar,
+                ticker, asof_date, ctx.earnings_calendar,
             ),
-            "news_count_7d_log": _news_count_7d_log(ticker, news_counts_7d),
+            "news_count_7d_log": _news_count_7d_log(ticker, ctx.news_counts_7d),
             "rel_strength_sector_etf_30d": etf_rs,
         }
         # Drop tickers that have any None feature (insufficient history).
@@ -214,6 +223,165 @@ def build_features(
             continue
         feats["ticker"] = ticker
         rows.append(feats)
+    return rows
+
+
+def build_features(
+    prices: pd.DataFrame,
+    universe: list[str],
+    asof_date: date,
+    politician_flows: dict[str, float] | None = None,
+    earnings_calendar: dict[str, date] | None = None,
+    earnings_surprises: dict[str, float] | None = None,
+    news_counts_7d: dict[str, int] | None = None,
+    workers: int = 1,
+    sorted_prices: SortedPrices | None = None,
+) -> pd.DataFrame:
+    """For each ticker in universe, compute the 16 features as of asof_date.
+
+    Args:
+        prices: multi-ticker price DataFrame with columns
+            ticker, date, open, high, low, close, adj_close, volume.
+            Must include SPY rows so rel_strength_spy_60d can resolve.
+        universe: tickers to score. SPY itself is included if it's in the list.
+        asof_date: date at which to evaluate the features.
+        politician_flows: optional ticker → net 30d politician dollar flow.
+        earnings_calendar: optional ticker → next earnings report_date AFTER
+            asof_date. When None or ticker absent, days_to_next_earnings
+            defaults to 60 (the cap — i.e. "no earnings soon").
+        news_counts_7d: optional ticker → news article count over [asof-7d, asof].
+            When None or ticker absent, news_count_7d_log defaults to 0
+            (log1p(0) = 0 — no news attention signal).
+        workers: processes to spread the per-ticker feature computation over.
+            DEFAULTS TO 1 (serial, no pool) on purpose: `spawn` costs ~1s of
+            interpreter startup per worker, which is a net LOSS on a single
+            cross-section — and MORE of a loss since 2026-08-27 shrank that
+            cross-section 4x while leaving spawn where it was. Measured on one
+            real 266-name asof at production scale: 0.568s serial, 1.661s at 2
+            workers, 2.845s at 4. The live predict path must not pay it.
+            Callers that build many asofs should parallelise at the asof level
+            instead — see build_training_set(feature_workers=...), which is
+            what the retrain uses and which calls this with workers=1.
+            Output is bit-identical at any worker count.
+        sorted_prices: optional prebuilt SortedPrices index over `prices`. Only
+            for callers that build MANY asof_dates off ONE price frame: the
+            index carries the per-ticker groupby and sort, so handing the same
+            one to every asof pays them once instead of once per date. It MUST
+            be built from this exact `prices` frame — nothing checks that, and
+            a stale index would quietly serve stale history. None (the default)
+            builds one here, which is what every single-asof caller wants.
+
+    Returns:
+        DataFrame indexed by ticker with FEATURE_NAMES as columns. Tickers
+        for which any feature is None (insufficient history) are DROPPED, not
+        emitted with NaN. The training loader handles missing-row exclusion.
+    """
+    # Local import to avoid circular dep when sma.sectors is loaded first.
+    from sma.sectors import SECTOR_ETF_FOR_GICS, SECTORS
+
+    # ONE pass over `prices` to split it by ticker and sort each group by date.
+    # Splitting used to be a dict comprehension,
+    # {t: prices[prices["ticker"] == t] for t in universe}, which ran a
+    # full-frame boolean scan PER TICKER — O(universe x rows), so the cost grew
+    # superlinearly in universe size. The breadth study (2026-08-17) measured
+    # 1.82 s/asof at 264 names vs 5.08 s/asof at 494: 2.8x the cost for 1.87x
+    # the names, extrapolating to ~64 min of feature build per retrain at 500
+    # names. groupby makes it linear (1ee39b1).
+    #
+    # SortedPrices additionally sorts each group ONCE so the per-(ticker, asof)
+    # truncation below is a searchsorted prefix slice. Groups are built for
+    # EVERY ticker present, not just the universe, which is what makes the SPY
+    # and sector-ETF benchmark windows below free.
+    index = sorted_prices if sorted_prices is not None else SortedPrices(prices)
+
+    # One window per ticker per asof_date — the whole point. Each is built once
+    # here and then read by all ~22 feature functions; before this, every one of
+    # them re-masked and re-sorted the ticker's full history for itself (67.0s
+    # of a 101.4s build, 226,352 calls on a 266-name x 2y slice).
+    windows_by_ticker: dict[str, PriceWindow] = {}
+    for t in universe:
+        w = index.window(t, asof_date)
+        # A universe ticker with no price rows is simply absent from the index;
+        # the pre-1ee39b1 comprehension gave it an empty frame instead. Both are
+        # handled identically by the guards in _feature_rows_for_tickers.
+        if w is not None:
+            windows_by_ticker[t] = w
+
+    # `index.empty_window` reproduces the old `prices.iloc[:0]` result (same
+    # columns and dtypes) for a frame that carries no SPY rows.
+    spy_window = index.window("SPY", asof_date)
+    if spy_window is None:
+        spy_window = index.empty_window(asof_date)
+    sector_etf_windows: dict[str, PriceWindow] = {}
+    for etf in set(SECTOR_ETF_FOR_GICS.values()):
+        w = index.window(etf, asof_date)
+        if w is not None:
+            sector_etf_windows[etf] = w
+    # Pre-group by sector so the sector-relative-strength lookup is O(1)
+    # instead of O(universe).
+    sector_members: dict[str, list[str]] = {}
+    for t in universe:
+        sec = SECTORS.get(t)
+        # ETFs are benchmarks, not within-sector members: SPY/NANC ("ETF") and
+        # the SPDR sector ETFs ("Sector ETF", e.g. XLK/XLE) have no meaningful
+        # GICS-sector peer group, so they neither form nor join peer buckets.
+        if sec is None or sec in ("ETF", "Sector ETF"):
+            continue
+        sector_members.setdefault(sec, []).append(t)
+
+    # Each ticker's 30d return, computed ONCE. The sector-leadership feature
+    # needs every peer's 30d return for every target, so computing it inside
+    # the per-ticker loop meant a sector of S names did S*(S-1) computations
+    # for S distinct values — the real quadratic in this function (53% of a
+    # 266-name asof under cProfile, 3.27s of 6.19s). Order of the peer list
+    # below is preserved so the mean's float sum is bit-identical.
+    #
+    # This stays SERIAL even at workers > 1, and deliberately: every chunk
+    # needs every OTHER chunk's 30d returns to form its sector peer mean, so
+    # fanning it out would need a gather barrier and a second pool dispatch per
+    # asof. Off a prebuilt window it is now nearly free; what dominates the
+    # serial preamble instead is SortedPrices, 0.067s of a 0.559s 266-name
+    # cross-section at production scale — an Amdahl floor of ~2.8x at 4
+    # workers, down from ~3.6x only because the parallel half got 4x cheaper.
+    # Callers that build many asofs pass `sorted_prices` and skip even that.
+    ret_30d_by_ticker: dict[str, float | None] = {
+        t: technical.ret_n_days(w, asof_date, 30)
+        for t, w in windows_by_ticker.items()
+    }
+
+    ctx = _AsofContext(
+        asof_date=asof_date,
+        windows_by_ticker=windows_by_ticker,
+        spy_window=spy_window,
+        sector_etf_windows=sector_etf_windows,
+        ret_30d_by_ticker=ret_30d_by_ticker,
+        sector_members=sector_members,
+        sectors=SECTORS,
+        sector_etf_for_gics=SECTOR_ETF_FOR_GICS,
+        politician_flows=politician_flows,
+        earnings_calendar=earnings_calendar,
+        earnings_surprises=earnings_surprises,
+        news_counts_7d=news_counts_7d,
+    )
+
+    n_workers = resolve_workers(workers, len(universe))
+    if n_workers == 1:
+        rows = _feature_rows_for_tickers(list(universe), ctx)
+    else:
+        # Chunks are CONTIGUOUS slices of `universe` and their results are
+        # concatenated in chunk order, so `rows` lands in exactly the order the
+        # serial loop produces it — which is what makes the output frame
+        # bit-identical rather than merely equal as a set.
+        chunks = contiguous_chunks(
+            list(universe), n_workers * _TICKER_CHUNKS_PER_WORKER,
+        )
+        rows = [
+            row
+            for chunk_rows in map_ordered(
+                _feature_rows_for_tickers, chunks, ctx, workers=n_workers,
+            )
+            for row in chunk_rows
+        ]
 
     if not rows:
         return pd.DataFrame(columns=["ticker"] + FEATURE_NAMES).set_index("ticker")

@@ -11,7 +11,7 @@ from datetime import date
 from unittest.mock import MagicMock
 
 from sma.ingest.store import Store
-from sma.live.__main__ import _resolve_reconcile_asof
+from sma.live.__main__ import _resolve_reconcile_asofs
 from sma.live.reconcile import _backfill_null_order_ids
 
 
@@ -36,7 +36,7 @@ def test_resolve_reconcile_asof_discovers_recovery_failed_batch(tmp_path, monkey
     asof = date(2026, 4, 30)
     store = _db_with_recovery_failed_row(tmp_path, asof=asof)
     try:
-        assert _resolve_reconcile_asof(None, store) == asof, (
+        assert _resolve_reconcile_asofs(None, store) == [asof], (
             "a NULL-id recovery_failed batch must stay discoverable — its "
             "order may be live (accepted) at the broker"
         )
@@ -50,8 +50,11 @@ def test_backfill_recovers_recovery_failed_rows(tmp_path):
     alpaca = MagicMock()
     alpaca.get_order_by_client_order_id.return_value = ("broker-id-123", "accepted")
     try:
-        recovered = _backfill_null_order_ids(asof=asof, store=store, alpaca=alpaca)
+        recovered, lookup_failures = _backfill_null_order_ids(
+            asof=asof, store=store, alpaca=alpaca
+        )
         assert recovered == 1
+        assert lookup_failures == 0
         row = store.conn.execute(
             "SELECT alpaca_order_id FROM intended_orders WHERE asof_date = ?",
             [asof],

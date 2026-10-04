@@ -34,6 +34,7 @@ def test_backup_e2e_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Full CLI run: backup file created, sentinel written, verified=true."""
     db = tmp_path / "sma.duckdb"
     backup_dir = tmp_path / "backups"
+    offsite_dir = tmp_path / "offsite"
     sentinel_dir = tmp_path / "sentinels"
 
     _make_valid_db(db)
@@ -57,6 +58,11 @@ def test_backup_e2e_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             str(backup_dir),
             "--db",
             str(db),
+            # 2026-08-24: --offsite-dir MUST be passed in any non-production
+            # invocation — omitting it used to silently land the copy in the
+            # real iCloud folder (see runner.MIN_BACKUP_SIZE_RATIO comment).
+            "--offsite-dir",
+            str(offsite_dir),
         ],
     )
 
@@ -67,6 +73,10 @@ def test_backup_e2e_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert backup_file.exists(), f"Expected backup at {backup_file}"
     assert backup_file.stat().st_size > 0
 
+    # Offsite copy went to the explicit override, not the real iCloud default.
+    offsite_file = offsite_dir / f"sma-{asof.isoformat()}.duckdb"
+    assert offsite_file.exists(), f"Expected offsite copy at {offsite_file}"
+
     # Sentinel should be written and verified
     sentinel = read_sentinel(label="com.sma.backup.daily", asof=asof)
     assert sentinel is not None
@@ -75,6 +85,28 @@ def test_backup_e2e_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert sentinel["backup_size_bytes"] > 0
     assert sentinel["label"] == "com.sma.backup.daily"
     assert sentinel["asof"] == asof.isoformat()
+
+
+def test_restore_command_reachable_as_module_main():
+    """`python -m sma.backup restore --help` must succeed.
+
+    Regression: the `if __name__ == "__main__": cli()` block used to sit ABOVE
+    the `@cli.command("restore")` decorator, so executing the module (not
+    importing it) invoked cli() before restore was registered — the DR restore
+    path was unreachable in production. The existing CliRunner tests missed it
+    because they IMPORT cli (guard skipped), so this drives the real module.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "sma.backup", "restore", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "restore" in proc.stdout.lower()
+    assert "--yes" in proc.stdout
 
 
 def test_restore_roundtrip(tmp_path, monkeypatch):
@@ -98,6 +130,7 @@ def test_restore_roundtrip(tmp_path, monkeypatch):
         r = CliRunner().invoke(cli, [
             "run", "--asof", "2026-04-29", "--db", str(db),
             "--backup-dir", str(bdir), "--models-dir", str(models),
+            "--offsite-dir", str(tmp_path / "offsite"),
         ])
     assert r.exit_code == 0, r.output
 

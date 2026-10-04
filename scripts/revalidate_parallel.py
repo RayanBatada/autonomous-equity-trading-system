@@ -22,7 +22,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 SCRATCH = Path(
-    "/private/tmp/claude-501/-Users-rayanbatada-SecondBrain/"
+    "/private/tmp/claude-501/-Users-youruser-SecondBrain/"
     "f0fae5bb-6213-478f-b88e-e8747330c663/scratchpad"
 )
 DB = SCRATCH / "sma-eval.duckdb"

@@ -64,9 +64,59 @@ def test_catch_up_calls_ingest_run_for_each_missing_day(monkeypatch):
     settings.secrets.alpaca_api_key = "k"
     settings.secrets.alpaca_api_secret = "s"
 
+    from types import SimpleNamespace
+    price_sources = [SimpleNamespace(name="yfinance"), SimpleNamespace(name="alpaca")]
     done = m._catch_up_missing_prices(
         db="data/sma.duckdb", asof=date(2026, 6, 4),
-        source_objs=[], universe_list=[], settings=settings,
+        source_objs=price_sources, universe_list=[], settings=settings,
     )
     assert done == 3
     assert calls == [date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3)]
+
+
+def test_catch_up_backfills_price_sources_only(monkeypatch):
+    """Catch-up must re-ingest PRICES only, never the full 7-source overlay set.
+
+    Re-running news/fundamentals/edgar for every missed day multiplies rate-
+    limited API calls (~20 min/day) and can blow the 20:30 ET ingest deadline
+    during a fragile recovery — today's 45d/7d incremental lookbacks already
+    re-cover the overlay windows, so only date-specific prices need backfilling.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from sma.ingest import __main__ as m
+
+    fake_con = MagicMock()
+    fake_con.execute.return_value.fetchone.return_value = (date(2026, 5, 29),)
+    import duckdb as _real_duckdb
+    monkeypatch.setattr(_real_duckdb, "connect", MagicMock(return_value=fake_con))
+
+    fake_alpaca = MagicMock()
+    fake_alpaca.sessions_between.return_value = _weekday_sessions(date(2026, 5, 29), date(2026, 6, 2))  # noqa: E501
+    import sma.live.alpaca_client as ac
+    monkeypatch.setattr(ac.AlpacaClient, "paper_from_env", classmethod(lambda cls, **kw: fake_alpaca))  # noqa: E501
+
+    captured = []
+    monkeypatch.setattr(m, "ingest_run", lambda **kw: captured.append(kw))
+
+    # Full enabled set, as objects with .name like the real source instances.
+    source_objs = [
+        SimpleNamespace(name=n)
+        for n in ("yfinance", "alpaca", "finnhub_news", "alpaca_news",
+                  "newsapi", "finnhub_fundamentals", "edgar")
+    ]
+
+    settings = MagicMock()
+    settings.secrets.alpaca_api_key = "k"
+    settings.secrets.alpaca_api_secret = "s"
+
+    m._catch_up_missing_prices(
+        db="data/sma.duckdb", asof=date(2026, 6, 2),
+        source_objs=source_objs, universe_list=[], settings=settings,
+    )
+
+    assert captured, "expected at least one backfill day"
+    for kw in captured:
+        names = sorted(s.name for s in kw["sources"])
+        assert names == ["alpaca", "yfinance"], f"overlay sources leaked into catch-up: {names}"

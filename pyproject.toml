@@ -6,8 +6,13 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.1.0",
     "httpx>=0.27.0",
-    "yfinance>=0.2.40",
+    "yfinance>=1.5",
     "alpaca-py>=0.30.0",
+    "requests>=2.31",  # transient dep of alpaca-py; imported directly for its
+                        # exception types by sma.live.alpaca_client's retry armor
+    "python-dotenv>=1.0",  # transient dep of pydantic-settings; imported directly
+                            # by sma.ingest.notify._ensure_dotenv_loaded to close
+                            # the .env-not-in-os.environ gap (see that docstring)
     "finnhub-python>=2.4.20",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
@@ -15,7 +20,12 @@ dependencies = [
     "loguru>=0.7",
     "python-dateutil>=2.9",
     "click>=8.1",
-    "xgboost>=2.0",
+    # Floor raised 2.0 -> 3.2 on 2026-07-30. Deployed models are pickled, and an
+    # xgboost pickle is not guaranteed to load under a different MAJOR version —
+    # a resolve that ignored uv.lock could have installed 2.x and failed to load
+    # the live artifact. The floor now matches what actually trained them
+    # (recorded per-artifact in `library_versions`).
+    "xgboost>=3.2",
     "scikit-learn>=1.8.0",
     "anthropic>=0.40.0",
     "lxml>=6.1.0",
@@ -47,6 +57,7 @@ pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = [
     "live: hits real APIs; skipped without RUN_LIVE_TESTS=1",
+    "serial: does real, substantial disk I/O whose byte-level assertions are measurably sensitive to concurrent resource contention (confirmed 2026-09-02: DuckDB CHECKPOINT/COPY-FROM-DATABASE file-size accounting shifts under concurrent load) -- must run with no other pytest-xdist worker active. Excluded from the -n 2/-n auto parallel pass; CI runs it separately (see .github/workflows/test.yml).",
 ]
 
 [tool.ruff]
@@ -70,3 +81,8 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM"]
 # feature studies) kept for reproducibility — allow the scratch import style
 # (sys.path setup before imports) and terse zips on top of the scripts rules.
 "scripts/pit/**/*" = ["E701", "E702", "E501", "N806", "N803", "N812", "N816", "E402", "B905"]
+
+[dependency-groups]
+dev = [
+    "pytest-xdist>=3.8.0",
+]

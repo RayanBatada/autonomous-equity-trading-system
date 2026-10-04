@@ -17,10 +17,20 @@ from sma.live.__main__ import _build_alpaca
 
 
 def _build_fake_settings(api_key: str, secret_key: str) -> MagicMock:
-    """Return a minimal settings mock with populated secrets."""
+    """Return a minimal settings mock with populated secrets.
+
+    `live.real_money` is pinned to the real defaults (both gates False). A bare
+    MagicMock would make every gate attribute truthy and route the test to the
+    REAL-money endpoint — which is exactly the accident the gates exist to
+    prevent, so the mock has to state them.
+    """
     settings = MagicMock()
     settings.secrets.alpaca_api_key = api_key
     settings.secrets.alpaca_api_secret = secret_key
+    settings.live.real_money.enabled = False
+    settings.live.real_money.real_money_ack = False
+    settings.live.real_money.max_real_equity = 1000.0
+    settings.live.real_money.dry_run = False
     return settings
 
 
@@ -43,7 +53,7 @@ def test_build_alpaca_reads_from_settings_not_environ(tmp_path, monkeypatch):
         secret_key="fake-secret-from-settings",
     )
 
-    with patch("sma.live.__main__.AlpacaClient") as mock_client_cls:
+    with patch("sma.live.real_money.AlpacaClient") as mock_client_cls:
         mock_client_cls.paper_from_env.return_value = MagicMock()
         client = _build_alpaca(settings)
 
@@ -105,3 +115,57 @@ def test_build_alpaca_env_file_supplies_key(tmp_path, monkeypatch):
     secrets = Secrets(_env_file=str(env_file))
     assert secrets.alpaca_api_key == "key-from-dotenv"
     assert secrets.alpaca_api_secret == "secret-from-dotenv"
+
+
+def test_build_alpaca_defaults_to_paper_endpoint(monkeypatch):
+    """Unarmed real_money config (the default, and what the paper bot runs on)
+    must construct a PAPER client and never touch live_from_env."""
+    settings = _build_fake_settings("k", "s")
+    with patch("sma.live.real_money.AlpacaClient") as mock_client_cls:
+        mock_client_cls.paper_from_env.return_value = MagicMock(paper=True)
+        _build_alpaca(settings)
+    mock_client_cls.paper_from_env.assert_called_once()
+    mock_client_cls.live_from_env.assert_not_called()
+
+
+def test_build_alpaca_requires_both_gates_for_live(monkeypatch):
+    """enabled alone is not enough — real_money_ack must also be set."""
+    settings = _build_fake_settings("k", "s")
+    settings.live.real_money.enabled = True   # ack still False
+    with patch("sma.live.real_money.AlpacaClient") as mock_client_cls:
+        mock_client_cls.paper_from_env.return_value = MagicMock(paper=True)
+        _build_alpaca(settings)
+    mock_client_cls.live_from_env.assert_not_called()
+
+
+def test_build_alpaca_refuses_live_above_equity_ceiling():
+    """Both gates armed but the account is bigger than the experiment was
+    authorised for: refuse, do not trade."""
+    import click
+
+    settings = _build_fake_settings("k", "s")
+    settings.live.real_money.enabled = True
+    settings.live.real_money.real_money_ack = True
+    settings.live.real_money.max_real_equity = 100.0
+
+    live_client = MagicMock(paper=False)
+    live_client.get_account.return_value = {"equity": 118_000.0}
+    with patch("sma.live.real_money.AlpacaClient") as mock_client_cls:
+        mock_client_cls.live_from_env.return_value = live_client
+        with pytest.raises(click.ClickException, match="max_real_equity"):
+            _build_alpaca(settings)
+
+
+def test_build_alpaca_allows_live_within_equity_ceiling():
+    settings = _build_fake_settings("k", "s")
+    settings.live.real_money.enabled = True
+    settings.live.real_money.real_money_ack = True
+    settings.live.real_money.max_real_equity = 1000.0
+
+    live_client = MagicMock(paper=False)
+    live_client.get_account.return_value = {"equity": 50.0}
+    with patch("sma.live.real_money.AlpacaClient") as mock_client_cls:
+        mock_client_cls.live_from_env.return_value = live_client
+        got = _build_alpaca(settings)
+    assert got is live_client
+    mock_client_cls.paper_from_env.assert_not_called()

@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
-sys.path.insert(0, "/private/tmp/claude-501/-Users-rayanbatada-SecondBrain/f0fae5bb-6213-478f-b88e-e8747330c663/scratchpad")
+sys.path.insert(0, "/private/tmp/claude-501/-Users-youruser-SecondBrain/f0fae5bb-6213-478f-b88e-e8747330c663/scratchpad")
 from membership import _norm, members_asof  # noqa: E402
 from shared_pit import make_memcon  # noqa: E402
 

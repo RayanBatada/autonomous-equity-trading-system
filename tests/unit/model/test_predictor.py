@@ -478,3 +478,177 @@ def test_earnings_surprise_train_serve_parity(tmp_path):
     trained = _compute_latest_surprises(earnings_df, asof)
     assert served == pytest.approx(trained)
     assert served["AAA"] == pytest.approx(-0.5)
+
+
+# ---------------------------------------------------------------------------
+# Lock-conflict retry (2026-08-05 post-mortem, 8/4 no-trade outage): predict's
+# read path must go through db_connect.read_only_connect so a TRANSIENT
+# overlap with a writer (ingest/agents/decide) is retried instead of crashing
+# instantly. _load_prices is the one predictor query method that does NOT
+# swallow exceptions (the others catch-and-default-empty), so it's the method
+# that actually surfaced the 2026-05-18 "duckdb.connect ... Conflicting lock"
+# crash trace — assert the retry/give-up behavior there.
+# ---------------------------------------------------------------------------
+
+def test_load_prices_retries_transient_lock_conflict_and_succeeds(tmp_path, monkeypatch):
+    """A lock conflict that clears within the retry budget must NOT crash
+    predict — read_only_connect retries it and _load_prices succeeds."""
+    db_path = _fresh_db(tmp_path)
+    _insert_prices(db_path, _synthetic_prices("AAA", ASOF, seed=1))
+    _insert_prices(db_path, _synthetic_prices("SPY", ASOF, seed=2))
+
+    real_connect = duckdb.connect
+    calls = {"n": 0}
+
+    def flaky_connect(path, read_only):
+        calls["n"] += 1
+        if calls["n"] < 3:  # fail twice (simulated writer overlap), then succeed
+            raise duckdb.IOException(
+                "IO Error: Could not set lock on file: Conflicting lock is held "
+                "in some other process (PID 12345)"
+            )
+        return real_connect(path, read_only=read_only)
+
+    monkeypatch.setattr("sma.db_connect.time.sleep", lambda s: None)
+    monkeypatch.setattr("sma.db_connect.duckdb.connect", flaky_connect)
+
+    predictor = Predictor(models_dir=tmp_path, db_path=db_path)
+    df = predictor._load_prices(ASOF, ["AAA"], 400)
+
+    assert calls["n"] == 3  # 2 failed attempts + 1 success, all inside the budget
+    assert not df.empty
+
+
+def test_load_prices_raises_after_retry_budget_when_lock_never_clears(tmp_path, monkeypatch):
+    """A lock held for the FULL retry budget (i.e. a long writer hold, like the
+    5.5h battery-slowed ingest on 2026-08-04) must still raise once the budget
+    is exhausted — read_only_connect's retry is for short transient overlaps
+    (seconds), not multi-hour holds. Recovering from a long hold is the
+    watchdog's job (it re-kicks predict on its next checkpoint once ingest's
+    sentinel lands), not this connector's."""
+    db_path = _fresh_db(tmp_path)
+    _insert_prices(db_path, _synthetic_prices("AAA", ASOF, seed=1))
+
+    def always_locked(path, read_only):
+        raise duckdb.IOException(
+            "IO Error: Could not set lock on file: Conflicting lock is held "
+            "in some other process (PID 12345)"
+        )
+
+    monkeypatch.setattr("sma.db_connect.time.sleep", lambda s: None)
+    monkeypatch.setattr("sma.db_connect.duckdb.connect", always_locked)
+
+    predictor = Predictor(models_dir=tmp_path, db_path=db_path)
+    with pytest.raises(duckdb.IOException, match="Conflicting lock"):
+        predictor._load_prices(ASOF, ["AAA"], 400)
+# ---------------------------------------------------------------------------
+# Seed ensemble (2026-08-24): serving an N-booster artifact
+# ---------------------------------------------------------------------------
+
+def _tiny_model_seeded(feature_names: list[str], seed: int) -> xgb.XGBRegressor:
+    """Same fit as _tiny_model but with a chosen random_state, so a set of
+    these is exactly what train_xgb's ensemble path produces.
+
+    subsample/colsample_bytree are production's 0.8 and are NOT optional here:
+    they are the only reason random_state changes the fit at all. At the
+    XGBoost defaults of 1.0 every seed returns a bit-identical model and these
+    tests would pass while proving nothing (see ensemble.seeds_are_inert).
+    """
+    rng = np.random.default_rng(42)
+    X = pd.DataFrame(rng.standard_normal((40, len(feature_names))), columns=feature_names)
+    y = pd.Series(rng.standard_normal(40))
+    model = xgb.XGBRegressor(
+        n_estimators=5, max_depth=2, random_state=seed,
+        subsample=0.8, colsample_bytree=0.8,
+    )
+    model.fit(X, y)
+    return model
+
+
+def _save_model_in(model, out_dir: Path, train_end: date) -> Path:
+    pkl_path, _ = save_model(
+        model=model,
+        hyperparams={"n_estimators": 5, "max_depth": 2},
+        feature_names=FEATURE_NAMES,
+        train_end_date=train_end,
+        train_rows=40,
+        train_rmse=0.5,
+        code_commit="ensemble",
+        training_duration_seconds=0.1,
+        output_dir=out_dir,
+    )
+    return pkl_path
+
+
+def test_predict_for_serves_an_ensemble_artifact(tmp_path):
+    from sma.model.ensemble import EnsembleModel
+
+    db_path = _fresh_db(tmp_path)
+    for ticker in UNIVERSE + ["SPY"]:
+        _insert_prices(db_path, _synthetic_prices(ticker, ASOF, seed=hash(ticker) % 999))
+
+    ensemble = EnsembleModel([_tiny_model_seeded(FEATURE_NAMES, s) for s in (42, 43, 44)])
+    pkl_path = _save_model_in(ensemble, tmp_path / "ens", date(2025, 6, 1))
+
+    result = Predictor(models_dir=pkl_path.parent, db_path=db_path).predict_for(ASOF, UNIVERSE)
+
+    assert set(result.keys()) == set(UNIVERSE)
+    for val in result.values():
+        assert isinstance(val, float)
+
+
+def test_predict_for_ensemble_equals_the_mean_of_serving_each_member(tmp_path):
+    """The whole serving path, end to end: what the ensemble artifact scores
+    must equal the average of what each member scores on its own. This is the
+    live-side half of train/serve parity — the CV gates average the same way."""
+    from sma.model.ensemble import EnsembleModel
+
+    db_path = _fresh_db(tmp_path)
+    for ticker in UNIVERSE + ["SPY"]:
+        _insert_prices(db_path, _synthetic_prices(ticker, ASOF, seed=hash(ticker) % 999))
+
+    seeds = (42, 43, 44)
+    members = [_tiny_model_seeded(FEATURE_NAMES, s) for s in seeds]
+
+    per_member = []
+    for i, member in enumerate(members):
+        d = _save_model_in(member, tmp_path / f"member{i}", date(2025, 6, 1)).parent
+        per_member.append(Predictor(models_dir=d, db_path=db_path).predict_for(ASOF, UNIVERSE))
+
+    ens_dir = _save_model_in(EnsembleModel(members), tmp_path / "ens", date(2025, 6, 1)).parent
+    got = Predictor(models_dir=ens_dir, db_path=db_path).predict_for(ASOF, UNIVERSE)
+
+    # The members must not be interchangeable, or this would prove nothing.
+    assert per_member[0] != per_member[1]
+    for ticker in UNIVERSE:
+        expected = float(np.mean([p[ticker] for p in per_member]))
+        assert got[ticker] == pytest.approx(expected, rel=1e-12)
+
+
+def test_predict_for_ensemble_is_deterministic(tmp_path):
+    """Same artifact, same inputs, identical output — across two independent
+    Predictor instances (so nothing rides on the in-process model cache)."""
+    from sma.model.ensemble import EnsembleModel
+
+    db_path = _fresh_db(tmp_path)
+    for ticker in UNIVERSE + ["SPY"]:
+        _insert_prices(db_path, _synthetic_prices(ticker, ASOF, seed=hash(ticker) % 999))
+
+    ensemble = EnsembleModel([_tiny_model_seeded(FEATURE_NAMES, s) for s in (42, 43, 44)])
+    models_dir = _save_model_in(ensemble, tmp_path / "ens", date(2025, 6, 1)).parent
+
+    first = Predictor(models_dir=models_dir, db_path=db_path).predict_for(ASOF, UNIVERSE)
+    second = Predictor(models_dir=models_dir, db_path=db_path).predict_for(ASOF, UNIVERSE)
+    assert first == second
+
+
+def test_ensemble_artifact_uses_the_models_own_feature_set(tmp_path):
+    """Predictor picks columns via `feature_names_in_`. An ensemble must
+    answer that the same way a bare estimator does, or serving an artifact
+    trained on a narrower feature set would crash (the 2026-05-18 12-feature
+    regression, now with N boosters)."""
+    from sma.model.ensemble import EnsembleModel
+
+    narrow = FEATURE_NAMES[:-1]
+    ensemble = EnsembleModel([_tiny_model_seeded(narrow, s) for s in (42, 43)])
+    assert list(ensemble.feature_names_in_) == narrow

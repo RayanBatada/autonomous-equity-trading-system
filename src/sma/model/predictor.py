@@ -9,6 +9,7 @@ import xgboost as xgb
 
 from sma.db_connect import read_only_connect
 from sma.features.builder import FEATURE_NAMES, build_features
+from sma.model.ensemble import EnsembleModel
 from sma.model.persistence import latest_model_for_date, load_model
 
 DEFAULT_MODELS_DIR = Path("models_artifacts")
@@ -39,7 +40,9 @@ class Predictor:
         self.db_path = db_path
         self.target = target
         self._conn = conn
-        self._model_cache: dict[Path, xgb.XGBRegressor | xgb.XGBRanker] = {}
+        self._model_cache: dict[
+            Path, xgb.XGBRegressor | xgb.XGBRanker | EnsembleModel
+        ] = {}
 
     def _fetch_news_counts_7d(
         self, asof_date: date, universe: list[str],
@@ -285,6 +288,12 @@ class Predictor:
         # 2026-05-18 12-feature 5/14 model.
         expected = list(getattr(model, "feature_names_in_", FEATURE_NAMES))
         x = feats_df[expected]
+        # One call for both artifact shapes. A single-booster artifact scores
+        # exactly as it always has; an EnsembleModel returns the MEAN of its N
+        # boosters' predictions (sma.model.ensemble). The averaging lives in
+        # the model object rather than here on purpose: the walk-forward CV
+        # that gates a retrain calls the same predict(), so the number the
+        # gate measures is the number that trades.
         preds = model.predict(x)
 
         predictions = {
@@ -292,7 +301,9 @@ class Predictor:
         }
         return predictions, model_id
 
-    def _load_or_get_cached(self, pkl_path: Path) -> xgb.XGBRegressor | xgb.XGBRanker:
+    def _load_or_get_cached(
+        self, pkl_path: Path,
+    ) -> xgb.XGBRegressor | xgb.XGBRanker | EnsembleModel:
         if pkl_path not in self._model_cache:
             self._model_cache[pkl_path] = load_model(pkl_path)
         return self._model_cache[pkl_path]

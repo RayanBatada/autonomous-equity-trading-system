@@ -17,6 +17,7 @@ from sma.model.persistence import (
     latest_model_for_date,
     load_metadata,
     load_model,
+    prune_old_artifacts,
     save_model,
     should_promote,
     write_predictions,
@@ -407,3 +408,228 @@ def test_save_model_records_train_start(tmp_path):
     assert load_metadata(jp)["train_start"] == "2018-01-01"
     # incumbent_train_start reads it back; legacy (absent) -> None
     assert incumbent_train_start(tmp_path, date(2025, 7, 1)) == "2018-01-01"
+
+
+def test_save_model_uniquifies_on_same_date_same_commit_collision(tmp_path):
+    """2026-07-01 review: the Monday retrain and autoresearch can both save on
+    the same train_end date at the same commit — the second save must NOT
+    overwrite the first (deployed!) artifact. It gets a -N suffix instead, and
+    the date still parses (parts[-2]) so latest_model_for_date keeps working."""
+    import numpy as np
+    import xgboost as xgb
+
+    from sma.model.persistence import latest_model_for_date, load_metadata, save_model
+
+    def _save():
+        m = xgb.XGBRegressor(n_estimators=2, max_depth=2)
+        m.fit(np.random.rand(20, 3), np.random.rand(20))
+        return save_model(
+            m, hyperparams={}, feature_names=["a", "b", "c"],
+            train_end_date=date(2025, 6, 30), train_rows=20, train_rmse=0.1,
+            code_commit="abcd1234", training_duration_seconds=1.0,
+            output_dir=tmp_path, cv_rmse=0.12,
+        )
+
+    p1, j1 = _save()
+    meta1 = load_metadata(j1)
+    p2, j2 = _save()
+    assert p1.exists() and j1.exists(), "first artifact must survive"
+    assert p2 != p1 and j2 != j1
+    assert p2.stem.endswith("-2")
+    assert load_metadata(j1) == meta1, "first metadata untouched"
+    # picker still resolves (same date; tie broken by created_at -> newest)
+    assert latest_model_for_date(tmp_path, date(2025, 7, 1)) in (p1, p2)
+
+
+# ---------------------------------------------------------------------------
+# Artifact pruning (2026-08-24 audit): models_artifacts/ had no retention
+# policy and grew unboundedly (13+ weekly pickles at ~355KB-800KB each).
+# prune_old_artifacts keeps the currently-serving model (whatever
+# latest_model_for_date would pick) plus the `keep_recent` most-recently-
+# created artifacts, and deletes the rest (.pkl + .json sidecar together).
+# It never looks inside models_dir/"rejected" — glob() is non-recursive,
+# same as latest_model_for_date, so quarantined candidates are untouched.
+# ---------------------------------------------------------------------------
+
+
+def _fake_artifact(
+    models_dir: Path, train_end: date, sha: str, created_at: str
+) -> Path:
+    """A lightweight stand-in artifact for pruning tests: real filename
+    convention + a real JSON sidecar (so _model_creation_dt / latest_model_
+    for_date behave exactly as in production), but no real pickle bytes —
+    pruning never unpickles, so this is much faster than training real
+    models for a directory of a dozen+ artifacts."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    base = f"xgb_ret_30d_forward_{train_end.isoformat()}_{sha}"
+    pkl = models_dir / f"{base}.pkl"
+    pkl.write_bytes(b"fake")
+    (models_dir / f"{base}.json").write_text(
+        json.dumps({"model_id": base, "created_at": created_at})
+    )
+    return pkl
+
+
+def test_prune_keeps_only_recent_n_when_no_older_serving_model(tmp_path):
+    models_dir = tmp_path / "models"
+    # 12 artifacts, one per day, oldest first.
+    paths = [
+        _fake_artifact(
+            models_dir, date(2026, 6, 1 + i), f"sha{i:02d}",
+            f"2026-06-{1 + i:02d}T12:00:00Z",
+        )
+        for i in range(12)
+    ]
+
+    deleted = prune_old_artifacts(models_dir, asof_date=date(2026, 6, 30), keep_recent=8)
+
+    remaining = {p.stem for p in models_dir.glob("*.pkl")}
+    assert len(remaining) == 8
+    # The 8 newest (last 8 created) survive; the 4 oldest are gone.
+    for p in paths[-8:]:
+        assert p.stem in remaining
+    for p in paths[:4]:
+        assert p.stem not in remaining
+    assert {p.stem for p in paths[:4]} == set(deleted)
+    # Sidecars go with their pickles.
+    for stem in {p.stem for p in paths[:4]}:
+        assert not (models_dir / f"{stem}.json").exists()
+
+
+def test_prune_never_deletes_the_serving_model_even_if_old(tmp_path):
+    """The hard constraint: an old artifact that is STILL the one
+    latest_model_for_date would serve (because everything newer trained
+    later than today's asof) must survive pruning regardless of rank."""
+    models_dir = tmp_path / "models"
+    old_serving = _fake_artifact(
+        models_dir, date(2026, 1, 1), "old0000", "2026-01-01T12:00:00Z"
+    )
+    # 9 artifacts newer than the asof_date used below, so they're NOT eligible
+    # to serve today but ARE more recently created -> would normally bump the
+    # old one out of a top-8-by-creation window.
+    future_paths = [
+        _fake_artifact(
+            models_dir, date(2026, 8, 1 + i), f"new{i:02d}",
+            f"2026-08-{1 + i:02d}T12:00:00Z",
+        )
+        for i in range(9)
+    ]
+
+    asof = date(2026, 1, 15)  # only old_serving is eligible to serve this date
+    deleted = prune_old_artifacts(models_dir, asof_date=asof, keep_recent=8)
+
+    assert old_serving.stem not in deleted
+    assert old_serving.exists()
+    assert old_serving.with_suffix(".json").exists()
+    # 9 future artifacts + 1 serving = 10 candidates; keep_recent=8 of the
+    # future ones plus the serving one that isn't among them -> 9 survive,
+    # exactly 1 of the 9 future artifacts (the oldest of them) is pruned.
+    remaining = {p.stem for p in models_dir.glob("*.pkl")}
+    assert len(remaining) == 9
+    assert old_serving.stem in remaining
+    assert future_paths[0].stem not in remaining  # oldest of the 9 futures
+
+
+def test_prune_no_op_when_at_or_under_keep_recent(tmp_path):
+    models_dir = tmp_path / "models"
+    for i in range(5):
+        _fake_artifact(
+            models_dir, date(2026, 6, 1 + i), f"sha{i:02d}",
+            f"2026-06-{1 + i:02d}T12:00:00Z",
+        )
+
+    deleted = prune_old_artifacts(models_dir, asof_date=date(2026, 6, 30), keep_recent=8)
+
+    assert deleted == []
+    assert len(list(models_dir.glob("*.pkl"))) == 5
+
+
+def test_prune_never_touches_rejected_subdir(tmp_path):
+    models_dir = tmp_path / "models"
+    for i in range(10):
+        _fake_artifact(
+            models_dir, date(2026, 6, 1 + i), f"sha{i:02d}",
+            f"2026-06-{1 + i:02d}T12:00:00Z",
+        )
+    rejected_dir = models_dir / "rejected"
+    rejected = _fake_artifact(
+        rejected_dir, date(2026, 6, 15), "rej0000", "2026-06-15T12:00:00Z"
+    )
+
+    prune_old_artifacts(models_dir, asof_date=date(2026, 6, 30), keep_recent=8)
+
+    assert rejected.exists()
+    assert rejected.with_suffix(".json").exists()
+
+
+def test_prune_missing_models_dir_returns_empty(tmp_path):
+    assert prune_old_artifacts(tmp_path / "nope", asof_date=date(2026, 1, 1)) == []
+
+
+def test_train_cli_prunes_artifacts_at_end():
+    """The retrain job (train CLI) must call prune_old_artifacts after saving
+    + writing the sentinel, so models_artifacts/ stops growing unboundedly
+    week over week. A full end-to-end CLI run needs a real DB/universe/CV
+    pipeline (covered by tests/integration/test_retrain_writes_sentinel.py);
+    this asserts the wiring itself exists so a future refactor that drops
+    the call is caught."""
+    import inspect
+
+    from sma.model import __main__ as model_main
+
+    assert hasattr(model_main, "prune_old_artifacts")
+    src = inspect.getsource(model_main.train.callback)
+    assert "prune_old_artifacts(" in src
+
+
+def test_train_cli_defaults_to_demean_labels():
+    """2026-06-29 incident: the installed retrain plist lost --demean-labels and
+    the CLI default (raw) silently deployed a beta-learning model through the
+    label-transition promote rule. Demean is the production standard, so the
+    DEFAULT must be demean; raw requires an explicit --raw-labels."""
+    from sma.model.__main__ import cli
+
+    param = {p.name: p for p in cli.commands["train"].params}["demean_labels"]
+    assert param.default is True
+
+
+# ---------------------------------------------------------------------------
+# Library-version provenance (2026-07-30)
+# ---------------------------------------------------------------------------
+
+
+def test_save_records_library_versions(tmp_path):
+    """The artifact must record the library versions it was trained under.
+
+    Models are persisted with `pickle.dump`, and an xgboost pickle is not
+    guaranteed to load — or to score identically — under a different xgboost
+    build. The sidecar already records `code_commit`, so you can tell which
+    SOURCE produced a model, but there was no way to tell which LIBRARIES did.
+
+    That matters for two reasons specific to this project:
+      1. `pyproject.toml`'s xgboost floor was `>=2.0` until 2026-07-30, when
+         it was raised to `>=3.2` (commit 817a441) to match the installed
+         3.2.0. Before that raise, a lockfile-less rebuild could have
+         resolved a different MAJOR version, and the deployed .pkl might
+         then have failed to load (or silently scored differently) on a
+         live book.
+      2. The project's core invariant is that backtest and live share one code
+         path, so what gets measured is what trades. Silent numerical drift
+         from a library upgrade breaks that parity, and without this metadata
+         there is no record to diagnose it against.
+    """
+    model, X = _tiny_model()
+    kwargs = _save_kwargs(model, X, date(2025, 6, 1), tmp_path)
+    _, json_path = save_model(**kwargs)
+
+    meta = json.loads(json_path.read_text())
+    assert "library_versions" in meta, "no library provenance recorded"
+
+    libs = meta["library_versions"]
+    for name in ("xgboost", "scikit-learn", "numpy", "pandas", "python"):
+        assert name in libs, f"{name} version not recorded: {libs}"
+        assert libs[name], f"{name} version is empty"
+
+    # Must be the ACTUAL running versions, not hard-coded strings.
+    assert libs["xgboost"] == xgb.__version__
+    assert libs["numpy"] == np.__version__

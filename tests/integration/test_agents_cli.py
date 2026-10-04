@@ -36,7 +36,9 @@ def test_run_friday_processes_full_universe(tmp_path, monkeypatch):
         patch("sma.agents.__main__.load_universe", return_value=["AAPL", "MSFT", "GOOGL"]),
     ):
         # 2026-04-24 is a Friday
-        result = runner.invoke(cli, ["run", "--asof-date", "2026-04-24"])
+        result = runner.invoke(
+            cli, ["run", "--asof-date", "2026-04-24", "--db", str(tmp_path / "t.duckdb")]
+        )
 
     assert result.exit_code == 0, result.output
     # Pipeline.run called for each of the 3 tickers
@@ -57,7 +59,9 @@ def test_run_thursday_processes_only_triggered_tickers(tmp_path, monkeypatch):
         patch("sma.agents.__main__.tickers_needing_refresh", return_value=["AAPL"]),
     ):
         # 2026-04-23 is a Thursday
-        result = runner.invoke(cli, ["run", "--asof-date", "2026-04-23"])
+        result = runner.invoke(
+            cli, ["run", "--asof-date", "2026-04-23", "--db", str(tmp_path / "t.duckdb")]
+        )
 
     assert result.exit_code == 0, result.output
     # Only AAPL processed
@@ -77,7 +81,13 @@ def test_run_force_full_overrides_weekday_logic(tmp_path, monkeypatch):
         patch("sma.agents.__main__.load_universe", return_value=["AAPL", "MSFT"]),
     ):
         # 2026-04-21 is a Tuesday
-        result = runner.invoke(cli, ["run", "--asof-date", "2026-04-21", "--force-full"])
+        result = runner.invoke(
+            cli,
+            [
+                "run", "--asof-date", "2026-04-21", "--force-full",
+                "--db", str(tmp_path / "t.duckdb"),
+            ],
+        )
 
     assert result.exit_code == 0, result.output
     assert fake_pipeline.run.call_count == 2
@@ -97,7 +107,9 @@ def test_run_swallows_per_ticker_pipeline_failures(tmp_path, monkeypatch):
         patch("sma.agents.__main__._build_context", return_value=MagicMock()),
         patch("sma.agents.__main__.load_universe", return_value=["AAPL", "MSFT"]),
     ):
-        result = runner.invoke(cli, ["run", "--asof-date", "2026-04-24"])
+        result = runner.invoke(
+            cli, ["run", "--asof-date", "2026-04-24", "--db", str(tmp_path / "t.duckdb")]
+        )
 
     assert result.exit_code == 0  # the runner should NOT die from one ticker's failure
     assert fake_pipeline.run.call_count == 2
@@ -112,7 +124,9 @@ def test_run_fails_fast_when_anthropic_key_missing(tmp_path, monkeypatch):
 
     err = ClickException("ANTHROPIC_API_KEY not set in .env; Phase 4 requires it")
     with patch("sma.agents.__main__._build_pipeline", side_effect=err):
-        result = runner.invoke(cli, ["run", "--asof-date", "2026-04-24"])
+        result = runner.invoke(
+            cli, ["run", "--asof-date", "2026-04-24", "--db", str(tmp_path / "t.duckdb")]
+        )
 
     assert result.exit_code != 0
     assert "ANTHROPIC_API_KEY" in result.output

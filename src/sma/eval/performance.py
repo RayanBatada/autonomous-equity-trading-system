@@ -32,6 +32,60 @@ def alpha_vs_benchmark(
     }
 
 
+def regression_alpha(
+    strategy_returns: list[float],
+    benchmark_returns: list[float],
+    min_n: int = 20,
+) -> dict[str, float | None]:
+    """OLS regression alpha of daily strategy returns on benchmark returns.
+
+    The naive excess (strat − bench) assumes beta=1; on a ~1.17-beta long book
+    it overstates selection skill by the beta-tilt's share of the market return
+    (~2.5pp at the 6/25 diagnosis). Regressing r_s = a + b·r_b separates the
+    leverage-like beta tilt (b) from actual selection alpha (a), and the t-stat
+    of `a` says whether that alpha is distinguishable from luck — require
+    |t| > 2 before claiming ANY skill. Returns alpha_daily, alpha_annualized
+    (×252), beta, t_stat, n; all-None when n < min_n or the benchmark series
+    has no variance.
+    """
+    none: dict[str, float | None] = {
+        "alpha_daily": None, "alpha_annualized": None,
+        "beta": None, "t_stat": None, "n": None,
+    }
+    n = min(len(strategy_returns), len(benchmark_returns))
+    if n < min_n:
+        return none
+    s = strategy_returns[:n]
+    b = benchmark_returns[:n]
+    # DB DOUBLEs can carry NaN/inf (e.g. a corrupted snapshot row); NaN slips
+    # through every downstream guard (`NaN <= 0` is False) and would render a
+    # confident-looking nan banner. Reject non-finite inputs outright.
+    import math
+    if not all(math.isfinite(v) for v in s) or not all(math.isfinite(v) for v in b):
+        return none
+    mean_b = sum(b) / n
+    mean_s = sum(s) / n
+    sxx = sum((x - mean_b) ** 2 for x in b)
+    if sxx <= 0:
+        return none
+    beta = sum((x - mean_b) * (y - mean_s) for x, y in zip(b, s, strict=True)) / sxx
+    alpha = mean_s - beta * mean_b
+    resid = [y - (alpha + beta * x) for x, y in zip(b, s, strict=True)]
+    dof = n - 2
+    s2 = sum(e * e for e in resid) / dof
+    # Degenerate perfect-fit guard: with ~zero residual variance both alpha and
+    # its SE are float noise and the ratio is garbage — report t=0 (no evidence).
+    se_alpha = 0.0 if s2 < 1e-20 else (s2 * (1.0 / n + mean_b * mean_b / sxx)) ** 0.5
+    t_stat = (alpha / se_alpha) if se_alpha > 0 else 0.0
+    return {
+        "alpha_daily": alpha,
+        "alpha_annualized": alpha * 252.0,
+        "beta": beta,
+        "t_stat": t_stat,
+        "n": n,
+    }
+
+
 def trust_level(n_live_days: int) -> tuple[str, str]:
     """How much the live P&L can be trusted, by sample size. Returns
     (level, explanation). The thresholds are deliberately conservative: a few

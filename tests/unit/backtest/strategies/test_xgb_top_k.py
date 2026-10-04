@@ -363,3 +363,84 @@ def test_tilt_context_gets_real_sector_mapping():
     assert captured["sector_nvda"] not in (None, "Unknown"), (
         "tilt() must see real sectors, not the 'Unknown' stub"
     )
+
+
+# ---------------------------------------------------------------------------
+# Entry conviction floor (min_score) — 2026-07-01. Default None = off.
+# ---------------------------------------------------------------------------
+def test_conviction_floor_drops_subfloor_names_and_holds_cash():
+    """min_score keeps only new-buy candidates whose RAW score clears the bar,
+    so weak names are skipped (fewer decisions = cash held)."""
+    strat = XGBoostTopKStrategy(
+        predictor=_fake_predictor(SCORES), universe=UNIVERSE, k=5,
+        target_weight_per_position=0.05, min_score=0.03,
+    )
+    decisions = strat.decide(ASOF, EMPTY_PRICES)
+    tickers = {d.ticker for d in decisions}
+    # Only AAA (0.10) and BBB (0.05) clear 0.03; CCC/DDD/EEE are held out → cash.
+    assert tickers == {"AAA", "BBB"}, tickers
+    assert len(decisions) == 2
+
+
+def test_conviction_floor_none_is_a_noop():
+    """Default min_score=None buys the full top-K (no names filtered)."""
+    strat = XGBoostTopKStrategy(
+        predictor=_fake_predictor(SCORES), universe=UNIVERSE, k=5,
+        target_weight_per_position=0.05, min_score=None,
+    )
+    assert len(strat.decide(ASOF, EMPTY_PRICES)) == 5
+
+
+def test_conviction_floor_above_all_holds_full_cash():
+    """A floor above every score buys nothing (holds cash), no crash."""
+    strat = XGBoostTopKStrategy(
+        predictor=_fake_predictor(SCORES), universe=UNIVERSE, k=5,
+        target_weight_per_position=0.05, min_score=0.5,
+    )
+    assert strat.decide(ASOF, EMPTY_PRICES) == []
+
+
+def test_conviction_floor_rejects_non_finite_scores():
+    """Bug: a bare `>= min_score` rejects NaN by accident (NaN compares False)
+    but lets a +inf score THROUGH and buys it. The gate must require a FINITE
+    score: +inf and NaN are both rejected; a finite score above the floor still
+    passes."""
+    scores = {
+        "AAA": float("inf"),   # degenerate model output → must be rejected
+        "BBB": float("nan"),   # must be rejected (as before)
+        "CCC": 0.10,           # finite, above the floor → kept
+        "DDD": 0.01,           # finite, below the floor → dropped
+    }
+    strat = XGBoostTopKStrategy(
+        predictor=_fake_predictor(scores), universe=["AAA", "BBB", "CCC", "DDD"],
+        k=4, target_weight_per_position=0.05, min_score=0.03,
+    )
+    tickers = {d.ticker for d in strat.decide(ASOF, EMPTY_PRICES)}
+    assert tickers == {"CCC"}, f"+inf/NaN leaked through the min_score gate; {tickers}"
+
+
+def test_conviction_floor_none_lets_inf_through_unchanged():
+    """The isfinite guard is scoped to the min_score gate: with min_score=None
+    the gate is skipped entirely, so an +inf score is NOT filtered here (default
+    behavior unchanged — inf handling is only the floor's concern)."""
+    scores = {"AAA": float("inf"), "BBB": 0.05}
+    strat = XGBoostTopKStrategy(
+        predictor=_fake_predictor(scores), universe=["AAA", "BBB"],
+        k=2, target_weight_per_position=0.05, min_score=None,
+    )
+    tickers = {d.ticker for d in strat.decide(ASOF, EMPTY_PRICES)}
+    assert tickers == {"AAA", "BBB"}, tickers
+
+
+def test_conviction_floor_is_entry_only_holds_are_exempt():
+    """A HELD name below the floor is retained (this is an entry gate, not an
+    exit): CCC (0.02, sub-floor) stays because it's already held."""
+    strat = XGBoostTopKStrategy(
+        predictor=_fake_predictor(SCORES), universe=UNIVERSE, k=5,
+        target_weight_per_position=0.05, min_score=0.03,
+    )
+    decisions = strat.decide(ASOF, EMPTY_PRICES, current_holdings={"CCC"})
+    tickers = {d.ticker for d in decisions}
+    assert "CCC" in tickers, f"held sub-floor name was wrongly dropped; {tickers}"
+    # New buys still floor-gated: only AAA + BBB join CCC.
+    assert tickers == {"AAA", "BBB", "CCC"}, tickers

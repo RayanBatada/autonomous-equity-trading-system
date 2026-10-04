@@ -14,7 +14,7 @@ from pathlib import Path
 import duckdb
 
 import sma.locks as _locks
-from sma.db_connect import read_only_connect
+from sma.db_connect import read_only_connect, writable_connect
 
 
 class WriterLockNotHeld(Exception):  # noqa: N818
@@ -327,6 +327,166 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON autoresearch_experiments(monotonicity_score DESC, sharpe_overall DESC);
     """,
     ),
+    (
+        7,
+        """
+        -- 2026-08-12: record WHERE a snapshot's equity came from. reconcile
+        -- runs at 16:30 but a boot-catch-up can run it in the evening, when
+        -- get_account().equity prices the book off AFTER-HOURS quotes rather
+        -- than the 16:00 close (7/29 off by thousands; 8/12 off by 0.17%).
+        -- The snapshot now prefers Alpaca's portfolio-history close and stamps
+        -- the source, so a bad row is identifiable instead of silently wrong.
+        -- NULL on every pre-existing row: provenance unknown, assume live read.
+        ALTER TABLE account_snapshots ADD COLUMN IF NOT EXISTS equity_source VARCHAR;
+    """,
+    ),
+    (
+        8,
+        """
+        -- 2026-08-20: the Mac was dark through the entire 2026-08-19 session,
+        -- so reconcile never ran and NO account_snapshots row exists for that
+        -- date at all. The 7-added backfill_official_closes() self-heal only
+        -- UPDATES an existing row's equity source -- it cannot CREATE a
+        -- missing one. backfill_missing_snapshots() (sma.live.reconcile) now
+        -- inserts a row for any of the last few trading sessions with no row,
+        -- sourced from Alpaca's OFFICIAL portfolio-history daily close only.
+        -- For a day the process never ran, cash / buying_power /
+        -- long_market_value / position_count are genuinely UNKNOWABLE in
+        -- retrospect (no broker read ever happened that day) -- storing a
+        -- fabricated value would be worse than storing nothing, so these
+        -- columns are relaxed to nullable. equity stays NOT NULL: the
+        -- gap-fill only ever inserts a row once the official close exists.
+        ALTER TABLE account_snapshots ALTER COLUMN cash DROP NOT NULL;
+        ALTER TABLE account_snapshots ALTER COLUMN buying_power DROP NOT NULL;
+        ALTER TABLE account_snapshots ALTER COLUMN long_market_value DROP NOT NULL;
+        ALTER TABLE account_snapshots ALTER COLUMN position_count DROP NOT NULL;
+    """,
+    ),
+    (
+        9,
+        """
+        -- 2026-08-27 money-path scale audit: widen the two share-quantity
+        -- columns from INTEGER to DOUBLE so a fractional quantity survives the
+        -- round trip. Nothing about today's behaviour changes -- the bot still
+        -- sizes whole shares (live.sizing.fractional_shares defaults false) and
+        -- INTEGER -> DOUBLE is a lossless widening for every existing row.
+        --
+        -- The migration lands BEFORE the feature it enables on purpose. With
+        -- these columns still INTEGER, flipping fractional_shares on would
+        -- write 2.5 shares into intended_orders as 2 and into paper_fills as 2,
+        -- and the ledger-vs-book drift detector -- which compares
+        -- SUM(paper_fills.filled_shares) against the live broker book -- would
+        -- then page every single day about a 0.5-share divergence that is
+        -- purely an artifact of the column type.
+        -- DuckDB refuses ALTER COLUMN on a table that has any index attached
+        -- ("Cannot alter entry ... because there are entries that depend on
+        -- it"), so each index is dropped and rebuilt around its ALTER. The
+        -- PRIMARY KEY / UNIQUE constraints survive untouched (verified against
+        -- a copy of the production DB: 333 intended_orders and 308 paper_fills
+        -- rows preserved, constraints intact, 2.5 shares round-trips).
+        DROP INDEX IF EXISTS idx_intended_orders_asof;
+        ALTER TABLE intended_orders ALTER COLUMN target_shares TYPE DOUBLE;
+        CREATE INDEX IF NOT EXISTS idx_intended_orders_asof ON intended_orders(asof_date);
+
+        DROP INDEX IF EXISTS idx_paper_fills_asof;
+        ALTER TABLE paper_fills ALTER COLUMN filled_shares TYPE DOUBLE;
+        CREATE INDEX IF NOT EXISTS idx_paper_fills_asof ON paper_fills(asof_date);
+    """,
+    ),
+    (
+        10,
+        """
+        -- 2026-09-26: multi-strategy sleeves (sma.strategies). What each
+        -- sleeve proposed on each decide night (live AND shadow; shadow
+        -- books never reach the order path) and what it earned over the next
+        -- session. Weights are fractions of the SLEEVE's capital. Written
+        -- by decide, scored by decide/reconcile (sma.strategies.attribution).
+        -- Pure CREATE IF NOT EXISTS: idempotent, touches no existing table.
+        CREATE TABLE IF NOT EXISTS sleeve_targets (
+            asof_date        DATE      NOT NULL,
+            session          VARCHAR   NOT NULL,
+            sleeve           VARCHAR   NOT NULL,
+            ticker           VARCHAR   NOT NULL,
+            weight           DOUBLE    NOT NULL,
+            mode             VARCHAR   NOT NULL,   -- live | shadow
+            capital_fraction DOUBLE,
+            run_id           BIGINT    NOT NULL,
+            created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (asof_date, session, sleeve, ticker)
+        );
+        CREATE TABLE IF NOT EXISTS sleeve_daily_returns (
+            asof_date DATE    NOT NULL,   -- the book's decide date; ret is over the next session
+            sleeve    VARCHAR NOT NULL,
+            mode      VARCHAR NOT NULL,
+            ret       DOUBLE,
+            gross     DOUBLE,
+            run_id    BIGINT  NOT NULL,
+            PRIMARY KEY (asof_date, sleeve)
+        );
+    """,
+    ),
+    (
+        11,
+        """
+        -- 2026-09-26: intraday sessions (strategy-expansion.md section 3).
+        -- 1) prices_intraday: 1-minute IEX bars (sma.ingest.intraday). `ts` is
+        --    the bar's START in UTC, stored naive. Re-ingest is an upsert on
+        --    the primary key, so a rerun of the same day is idempotent.
+        -- 2) session / order_type on the order audit trail, so fill quality
+        --    can be split by time of day. NULL on every existing row means
+        --    the open path (session 'open', order_type 'opg'). limit_price is
+        --    the marketable limit a session order was priced at.
+        -- Plain ADD COLUMN, nullable, no index rebuild needed (verified on a
+        -- copy of the production DB: 374 intended_orders / 353 paper_fills
+        -- rows preserved, duckdb 1.5.2).
+        CREATE TABLE IF NOT EXISTS prices_intraday (
+            ticker  VARCHAR   NOT NULL,
+            ts      TIMESTAMP NOT NULL,
+            open    DOUBLE,
+            high    DOUBLE,
+            low     DOUBLE,
+            close   DOUBLE,
+            volume  BIGINT,
+            source  VARCHAR   NOT NULL,
+            run_id  BIGINT    NOT NULL,
+            PRIMARY KEY (ticker, ts, source)
+        );
+        ALTER TABLE intended_orders ADD COLUMN IF NOT EXISTS session VARCHAR;
+        ALTER TABLE intended_orders ADD COLUMN IF NOT EXISTS order_type VARCHAR;
+        ALTER TABLE intended_orders ADD COLUMN IF NOT EXISTS limit_price DOUBLE;
+        ALTER TABLE paper_fills ADD COLUMN IF NOT EXISTS session VARCHAR;
+        ALTER TABLE paper_fills ADD COLUMN IF NOT EXISTS order_type VARCHAR;
+    """,
+    ),
+    (
+        12,
+        """
+        -- 2026-09-26: per-fill counterfactual prints. For every paper fill,
+        -- the fill day's official open and close next to the fill price, so
+        -- "would the open auction / the close have been cheaper" is answered
+        -- from live fills with zero order changes. Written by reconcile
+        -- (sma.live.reconcile.record_fill_counterfactuals), backfilled for
+        -- every existing fill on its first run, frozen once both prints are
+        -- in (so a later split restatement of history cannot rewrite it).
+        -- bp columns are signed COST: + means the fill was worse than the
+        -- print (paid more on a buy, received less on a sell).
+        CREATE TABLE IF NOT EXISTS fill_counterfactuals (
+            alpaca_order_id VARCHAR   PRIMARY KEY,
+            ticker          VARCHAR   NOT NULL,
+            side            VARCHAR   NOT NULL,
+            fill_date       DATE      NOT NULL,   -- ET session date of filled_at
+            fill_price      DOUBLE    NOT NULL,
+            filled_shares   DOUBLE    NOT NULL,
+            open_print      DOUBLE,
+            close_print     DOUBLE,
+            print_source    VARCHAR,              -- yfinance (consolidated) | alpaca (IEX)
+            open_bp         DOUBLE,
+            close_bp        DOUBLE,
+            computed_at     TIMESTAMP NOT NULL,
+            run_id          BIGINT    NOT NULL
+        );
+    """,
+    ),
 ]
 
 
@@ -366,7 +526,11 @@ class Store:
             # holds the writer lock; read_only_connect retries with backoff.
             self.conn = read_only_connect(self.path)
         else:
-            self.conn = duckdb.connect(self.path, read_only=read_only)
+            # Lock-tolerant like the read path: a bare writable open dies
+            # instantly if it lands inside another process's brief read
+            # connection (duckdb: one writer XOR N readers across processes;
+            # our flock only serializes our own writers). Retries w/ backoff.
+            self.conn = writable_connect(self.path)
             self._apply_migrations()
         return self
 

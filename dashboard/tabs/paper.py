@@ -13,6 +13,8 @@ For real-time positions, log into the Alpaca paper dashboard at
 https://app.alpaca.markets/paper/dashboard/overview.
 """
 
+from types import SimpleNamespace
+
 import duckdb
 import pandas as pd
 import plotly.express as px
@@ -20,8 +22,17 @@ import streamlit as st
 
 from dashboard.data import DB_PATH
 from sma.db_connect import read_only_connect
+from sma.live.decide import _clean_snapshot_equities
+from sma.live.reconcile import snapshot_staleness_message, snapshot_staleness_sessions
 from sma.readiness import sentinel_lineage_stale
 from sma.sentinels import read_sentinel
+
+#: The paper account's original deposit. The SPY comparison line is normalized
+#: to it so both series start from the same dollar figure — it is a fact about
+#: THIS account, not a backtest knob (that one is
+#: sma.backtest.simulator.DEFAULT_INITIAL_CASH). If the account is ever
+#: re-funded at a different size, change it here.
+PAPER_STARTING_EQUITY = 100_000.0
 
 INGEST_LABEL = "com.sma.ingest.daily"
 PREDICT_LABEL = "com.sma.model.predict.daily"
@@ -82,9 +93,81 @@ def _last_snapshot() -> dict | None:
 
 
 @st.cache_data(ttl=15)
-def _equity_curve_df() -> pd.DataFrame:
+def _snapshot_staleness_sessions(snapshot_date) -> int:
+    """Trading sessions elapsed since `snapshot_date`, via the shared
+    prices-table proxy (no Alpaca call -- see snapshot_staleness_sessions)."""
     con = _ro_conn()
     try:
+        return snapshot_staleness_sessions(conn=con, snapshot_date=snapshot_date)
+    finally:
+        con.close()
+
+
+def _with_daily_changes(df: pd.DataFrame) -> pd.DataFrame:
+    """Add daily_change_dollars / daily_change_pct to `df` (must already be
+    sorted ascending by asof_date with an `equity` column).
+
+    Computed against the previous row IN THE FRAME, never a fabricated
+    zero-filled row -- so a change row that follows a missing snapshot day
+    (e.g. 2026-08-04) is simply the multi-day delta, not corrupted by a gap.
+    """
+    out = df.copy()
+    out["daily_change_dollars"] = out["equity"].diff()
+    out["daily_change_pct"] = out["equity"].pct_change() * 100.0
+    return out
+
+
+def _equity_summary_stats(df: pd.DataFrame) -> dict:
+    """Pure current/start/peak/max-drawdown-from-peak summary.
+
+    `df` must be sorted ascending by asof_date with a garbage-free `equity`
+    column (see _equity_history_df). Empty input returns all-None rather
+    than raising or dividing by zero.
+    """
+    if df.empty:
+        return {"current": None, "start": None, "peak": None, "max_drawdown_pct": None}
+    equity = df["equity"].astype(float)
+    peak_series = equity.cummax()
+    drawdown_pct = (equity - peak_series) / peak_series * 100.0
+    return {
+        "current": float(equity.iloc[-1]),
+        "start": float(equity.iloc[0]),
+        "peak": float(equity.max()),
+        "max_drawdown_pct": float(drawdown_pct.min()),
+    }
+
+
+@st.cache_data(ttl=60)
+def _equity_history_df() -> pd.DataFrame:
+    """Full account_snapshots history for the Equity History section.
+
+    Garbage rows (2026-07-07 Alpaca broker-wipe: a ~$6,935 equity reading,
+    real incident, self-healed the next day) are dropped via the SAME
+    >50%-off-trailing-median guard decide.py's live catastrophic-loss abort
+    and drawdown rail use -- imported directly from sma.live.decide rather
+    than reimplemented, so the dashboard and the live trading path always
+    agree on what counts as garbage.
+
+    Gaps (e.g. the missing 2026-08-04 snapshot) are NEVER forward-filled or
+    zero-filled: a missing date is simply absent from the returned frame, so
+    callers render it as a visual gap, not a fake $0 reading.
+    """
+    con = _ro_conn()
+    try:
+        max_date = con.execute(
+            "SELECT MAX(asof_date) FROM account_snapshots"
+        ).fetchone()[0]
+        if max_date is None:
+            return pd.DataFrame()
+        # _clean_snapshot_equities only touches `store.conn` -- a bare
+        # duckdb connection wrapped in a namespace satisfies that without
+        # pulling in the full Store class (which wants a writable path).
+        clean_dates = {
+            d
+            for d, _ in _clean_snapshot_equities(
+                SimpleNamespace(conn=con), asof=max_date
+            )
+        }
         df = con.execute("""
             SELECT asof_date, equity, cash, long_market_value, position_count
             FROM account_snapshots
@@ -92,9 +175,27 @@ def _equity_curve_df() -> pd.DataFrame:
         """).df()
     finally:
         con.close()
-    if not df.empty:
-        df["asof_date"] = pd.to_datetime(df["asof_date"])
-    return df
+    if df.empty:
+        return df
+    df["asof_date"] = pd.to_datetime(df["asof_date"])
+    df = df[df["asof_date"].dt.date.isin(clean_dates)].reset_index(drop=True)
+    return _with_daily_changes(df)
+
+
+def _align_spy_to_equity_window(spy: pd.DataFrame, last_date) -> pd.DataFrame:
+    """Truncate a SPY-returns frame (from _bench_returns_df) to end at
+    `last_date`.
+
+    SPY prices update daily regardless of account_snapshots gaps -- on a day
+    like 2026-08-04 (a missing reconcile snapshot) SPY can carry a fresher
+    price than the latest equity row. Comparing the portfolio's return
+    through its last snapshot against SPY's return through a LATER date
+    silently overstates SPY (and understates alpha), since the two series no
+    longer cover the same window. `spy` must have a `date` column.
+    """
+    if spy.empty:
+        return spy
+    return spy[spy["date"] <= last_date]
 
 
 def _prediction_lineage_stale(asof) -> bool:
@@ -280,15 +381,17 @@ def _alpha_trust_banner() -> None:
     long, so absolute return is mostly market beta — only EXCESS over SPY is
     evidence of edge, and at a tiny live sample even that is noise. Surfacing this
     stops early P&L from being over-read as skill."""
-    from sma.eval.performance import alpha_vs_benchmark, trust_level
+    from sma.eval.performance import alpha_vs_benchmark, regression_alpha, trust_level
 
+    # _equity_history_df already drops the 2026-07-07 broker-wipe garbage row
+    # (~$6.9k) via the shared decide.py guard -- without this, that single row
+    # injected a fake ~-94%/+1500% day-pair into the regression below and
+    # skewed the reported beta/alpha/t-stat.
+    hist = _equity_history_df()
+    dates = [d.strftime("%Y-%m-%d") for d in hist["asof_date"]]
+    eq = [float(e) for e in hist["equity"]]
     con = _ro_conn()
     try:
-        snaps = con.execute(
-            "SELECT asof_date, equity FROM account_snapshots ORDER BY asof_date"
-        ).fetchall()
-        dates = [str(r[0]) for r in snaps]
-        eq = [float(r[1]) for r in snaps]
         spy = [
             con.execute(
                 "SELECT adj_close FROM prices WHERE ticker='SPY' AND date=? "
@@ -300,14 +403,42 @@ def _alpha_trust_banner() -> None:
     finally:
         con.close()
 
-    pairs = [(e, float(s[0])) for e, s in zip(eq, spy, strict=True) if s is not None]
+    # Positive-value filter: a missing SPY price for a given date must not
+    # divide-by-zero and kill the whole tab.
+    pairs = [
+        (e, float(s[0])) for e, s in zip(eq, spy, strict=True)
+        if s is not None and e > 0 and float(s[0]) > 0
+    ]
     if len(pairs) < 2:
         return
     a = alpha_vs_benchmark([e for e, _ in pairs], [s for _, s in pairs])
     lvl, msg = trust_level(len(eq))
+    # TRUE selection alpha: regress daily strategy returns on SPY returns. The
+    # naive excess above assumes beta=1; this book runs ~1.17 beta, so the
+    # excess flatters selection by the beta tilt (diagnosis 2026-06-25). Claim
+    # NO skill until |t| > 2.
+    eqs = [e for e, _ in pairs]
+    sps = [s for _, s in pairs]
+    strat_r = [eqs[i] / eqs[i - 1] - 1 for i in range(1, len(eqs))]
+    bench_r = [sps[i] / sps[i - 1] - 1 for i in range(1, len(sps))]
+    reg = regression_alpha(strat_r, bench_r)
+    if reg["alpha_daily"] is not None:
+        verdict = (
+            "statistically REAL (|t|>2)" if abs(reg["t_stat"]) > 2
+            else "indistinguishable from luck (|t|≤2)"
+        )
+        reg_line = (
+            f"Regression: **beta {reg['beta']:.2f}**, true selection alpha "
+            f"**{reg['alpha_annualized']:+.1%}/yr** (t={reg['t_stat']:+.2f}, "
+            f"n={reg['n']}) — {verdict}.  \n"
+        )
+    else:
+        reg_line = "Regression alpha: not enough daily returns yet (need ≥20).  \n"
     line = (
         f"**Strategy {a['strategy_return']:+.2%}** vs **SPY {a['benchmark_return']:+.2%}** "
-        f"→ **excess (alpha) {a['excess_return']:+.2%}** over {len(eq)} live days.  \n"
+        f"→ naive excess {a['excess_return']:+.2%} (assumes beta=1; overstated on a "
+        f"beta>1 book) over {len(eq)} live days.  \n"
+        f"{reg_line}"
         f"Trust **{lvl}** — {msg}"
     )
     render_fn = {"LOW": st.error, "MEDIUM": st.warning, "HIGH": st.success}[lvl]
@@ -421,62 +552,102 @@ def render() -> None:
         )
         return
 
-    # --- Equity curve
-    st.subheader("Account equity curve (account_snapshots)")
-    eq_df = _equity_curve_df()
-    if not eq_df.empty:
-        long = eq_df.melt(
+    # --- Equity History: day-by-day account equity ("what were we at on
+    # different days"). Garbage rows dropped, gaps rendered as gaps -- see
+    # _equity_history_df.
+    st.subheader("Equity history")
+    staleness_msg = snapshot_staleness_message(
+        sessions=_snapshot_staleness_sessions(last_snap["asof_date"]),
+        snapshot_date=last_snap["asof_date"],
+    )
+    if staleness_msg:
+        st.warning(staleness_msg)
+    hist_df = _equity_history_df()
+    if hist_df.empty:
+        st.info("No account snapshots yet.")
+    else:
+        first_date = hist_df["asof_date"].iloc[0]
+        last_date = hist_df["asof_date"].iloc[-1]
+        spy = _align_spy_to_equity_window(_bench_returns_df(first_date.date()), last_date)
+
+        # --- (a) line chart: equity vs SPY, both normalized to $100k start
+        chart_df = hist_df[["asof_date", "equity"]].rename(columns={"equity": "Portfolio"})
+        if not spy.empty:
+            spy_dollars = spy.rename(columns={"date": "asof_date"}).copy()
+            spy_dollars["SPY"] = PAPER_STARTING_EQUITY * (
+                1.0 + spy_dollars["spy_return_pct"] / 100.0
+            )
+            chart_df = chart_df.merge(
+                spy_dollars[["asof_date", "SPY"]], on="asof_date", how="left"
+            )
+        long = chart_df.melt(id_vars=["asof_date"], var_name="series", value_name="dollars")
+        fig = px.line(
+            long, x="asof_date", y="dollars", color="series",
+            title="Account equity vs SPY (both normalized to a $100k start)",
+            color_discrete_map={"Portfolio": "#1f77b4", "SPY": "#ff7f0e"},
+        )
+        fig.add_hline(
+            y=PAPER_STARTING_EQUITY, line_dash="dot", line_color="gray",
+            annotation_text=f"${PAPER_STARTING_EQUITY / 1000:,.0f}k baseline",
+        )
+        st.plotly_chart(fig, width="stretch")
+
+        # --- (c) summary stats: current vs start, peak, max drawdown from peak
+        stats = _equity_summary_stats(hist_df)
+        vs_start_pct = (stats["current"] / stats["start"] - 1.0) * 100.0
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(
+            "Current equity", f"${stats['current']:,.2f}",
+            f"{vs_start_pct:+.2f}% vs start",
+        )
+        c2.metric("Start", f"${stats['start']:,.2f}")
+        c3.metric("Peak", f"${stats['peak']:,.2f}")
+        c4.metric("Max drawdown from peak", f"{stats['max_drawdown_pct']:.2f}%")
+        if not spy.empty:
+            spy_latest_pct = spy["spy_return_pct"].iloc[-1]
+            st.caption(
+                f"vs SPY over the same window: SPY {spy_latest_pct:+.2f}%, "
+                f"naive alpha (assumes beta=1) {vs_start_pct - spy_latest_pct:+.2f}pp."
+            )
+
+        # --- (b) table, newest first: date, equity, daily Δ$, daily Δ%, cash, positions
+        table_df = hist_df.sort_values("asof_date", ascending=False).copy()
+        table_df["Date"] = table_df["asof_date"].dt.strftime("%Y-%m-%d")
+        table_df = table_df.rename(columns={
+            "equity": "Equity", "daily_change_dollars": "Daily Δ$",
+            "daily_change_pct": "Daily Δ%", "cash": "Cash",
+            "position_count": "Positions",
+        })
+        st.dataframe(
+            table_df[["Date", "Equity", "Daily Δ$", "Daily Δ%", "Cash", "Positions"]],
+            hide_index=True, width="stretch", height=400,
+            column_config={
+                "Equity": st.column_config.NumberColumn(format="dollar"),
+                "Daily Δ$": st.column_config.NumberColumn(format="dollar"),
+                "Daily Δ%": st.column_config.NumberColumn(format="%.2f%%"),
+                "Cash": st.column_config.NumberColumn(format="dollar"),
+            },
+        )
+        st.caption(
+            "Garbage rows (e.g. the 2026-07-07 Alpaca broker-wipe reading of "
+            "~$6.9k, self-healed the next day) are dropped via the same "
+            ">50%-off-trailing-median guard `decide.py` uses. Missing days "
+            "(e.g. 2026-08-04) are gaps in the chart/table, never a "
+            "zero-filled row."
+        )
+
+        # --- Cash / long market value breakdown (same clean rows)
+        st.subheader("Cash / market value breakdown")
+        breakdown = hist_df.melt(
             id_vars=["asof_date"],
             value_vars=["equity", "cash", "long_market_value"],
             var_name="metric", value_name="dollars",
         )
-        fig = px.line(
-            long, x="asof_date", y="dollars", color="metric",
+        fig2 = px.line(
+            breakdown, x="asof_date", y="dollars", color="metric",
             title="Equity / cash / long market value over time",
         )
-        st.plotly_chart(fig, width="stretch")
-        st.dataframe(eq_df.tail(10), width="stretch")
-
-        # --- Performance vs SPY (the question that matters)
-        st.subheader("Performance vs SPY benchmark")
-        first_date = eq_df["asof_date"].iloc[0]
-        base_equity = eq_df["equity"].iloc[0]
-        portfolio = eq_df[["asof_date", "equity"]].copy()
-        portfolio["return_pct"] = (portfolio["equity"] / base_equity - 1.0) * 100.0
-        portfolio = portfolio.rename(columns={"asof_date": "date"})
-        portfolio["metric"] = "Portfolio"
-        spy = _bench_returns_df(first_date.date())
-        if spy.empty:
-            st.info("No SPY price data — can't render benchmark.")
-        else:
-            spy_chart = spy.rename(columns={"spy_return_pct": "return_pct"})
-            spy_chart["metric"] = "SPY"
-            combined = pd.concat(
-                [portfolio[["date", "return_pct", "metric"]],
-                 spy_chart[["date", "return_pct", "metric"]]],
-                ignore_index=True,
-            )
-            fig2 = px.line(
-                combined, x="date", y="return_pct", color="metric",
-                title="Cumulative return: portfolio vs SPY (% from first snapshot)",
-                color_discrete_map={"Portfolio": "#1f77b4", "SPY": "#ff7f0e"},
-            )
-            fig2.add_hline(y=0, line_dash="dot", line_color="gray")
-            st.plotly_chart(fig2, width="stretch")
-            # Side-by-side latest reading
-            portfolio_latest = portfolio["return_pct"].iloc[-1]
-            spy_latest = spy["spy_return_pct"].iloc[-1]
-            alpha = portfolio_latest - spy_latest
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Portfolio", f"{portfolio_latest:+.2f}%")
-            c2.metric("SPY", f"{spy_latest:+.2f}%")
-            c3.metric(
-                "Alpha (portfolio − SPY)", f"{alpha:+.2f}%",
-                delta=f"{alpha:+.2f}pp",
-                delta_color=("normal" if alpha > 0 else "inverse"),
-            )
-    else:
-        st.info("No account snapshots yet.")
+        st.plotly_chart(fig2, width="stretch")
 
     # --- Drift indicators
     st.subheader("Drift indicators (last 14 days)")

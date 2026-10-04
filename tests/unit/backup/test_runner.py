@@ -313,3 +313,283 @@ def test_retention_prunes_model_dirs_with_db_files(tmp_path: Path, monkeypatch: 
         run_backup(db_path=db, backup_dir=backup_dir, asof=date(2026, 4, 29))
     assert not (backup_dir / f"sma-{old.isoformat()}.duckdb").exists()
     assert not olddir.exists(), "model dirs must follow the same retention"
+
+
+# ---------------------------------------------------------------------------
+# Offsite copy (2026-07-30): backups were moved OFF iCloud on 2026-06-04
+# because iCloud's sync daemon corrupted backups written directly into the
+# synced folder mid-write. The safe direction is the reverse: only COPY the
+# already-verified, finished local backup into the offsite (iCloud) dir, via
+# a temp name + rename so the sync daemon only ever sees complete files.
+# ---------------------------------------------------------------------------
+
+
+def test_offsite_copy_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    offsite_dir = tmp_path / "offsite"
+    _make_valid_db(db)
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    asof = date(2026, 4, 29)
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(
+            db_path=db, backup_dir=backup_dir, offsite_dir=offsite_dir, asof=asof,
+        )
+
+    local = backup_dir / f"sma-{asof.isoformat()}.duckdb"
+    offsite = offsite_dir / f"sma-{asof.isoformat()}.duckdb"
+    assert offsite.exists(), "verified backup was not copied offsite"
+    assert offsite.read_bytes() == local.read_bytes()
+    assert not (offsite_dir / f"sma-{asof.isoformat()}.duckdb.tmp").exists(), (
+        "temp file left behind — copy must finish with an atomic rename"
+    )
+    assert payload["offsite"]["copied"] is True
+    assert payload["offsite"]["path"] == str(offsite)
+
+
+def test_offsite_copy_only_attempted_after_verification_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A backup that fails verification must NOT be trusted offsite either —
+    only a verified, finished local file is copied."""
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    offsite_dir = tmp_path / "offsite"
+    _make_valid_db(db)
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+    monkeypatch.setattr("sma.backup.runner._verify_backup", lambda path: False)
+
+    asof = date(2026, 4, 29)
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(
+            db_path=db, backup_dir=backup_dir, offsite_dir=offsite_dir, asof=asof,
+        )
+
+    assert payload["offsite"]["attempted"] is False
+    assert payload["offsite"]["copied"] is False
+    assert not (offsite_dir / f"sma-{asof.isoformat()}.duckdb").exists()
+
+
+def test_offsite_dir_uncreatable_does_not_fail_main_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An offsite failure (e.g. iCloud unreachable, permission denied) must
+    NOT fail the main backup — log + notify_failure, continue."""
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    _make_valid_db(db)
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    # A regular FILE where the offsite dir wants to be -> mkdir(parents=True)
+    # fails with NotADirectoryError.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    bad_offsite_dir = blocker / "sma-backups"
+
+    notified: list[tuple[str, str]] = []
+    asof = date(2026, 4, 29)
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(
+            db_path=db, backup_dir=backup_dir, offsite_dir=bad_offsite_dir, asof=asof,
+            notify_fn=lambda title, message: notified.append((title, message)),
+        )
+
+    assert payload["verified"] is True
+    assert payload["quality"]["passed"] is True, (
+        "offsite failure must not fail the main (local) backup"
+    )
+    assert payload["offsite"]["attempted"] is True
+    assert payload["offsite"]["copied"] is False
+    assert payload["offsite"]["error"]
+    assert any("offsite" in t.lower() for t, _m in notified)
+
+
+
+# ---------------------------------------------------------------------------
+# Backup size sanity (2026-08-24 incident): an out-of-band run against a
+# near-empty worktree dev database (data/sma.duckdb in .worktrees/brk-earnings-
+# fix, 1,323,008 bytes, all 8 schema migrations applied within the same
+# second — i.e. freshly initialized, not the real 366MB production DB) landed
+# a small-but-schema-"verified" stub at the REAL production offsite filename
+# (sma-2026-08-24.duckdb) in the real iCloud folder. `_verify_backup` only
+# checks that `_schema_version` is queryable — it has no opinion on whether
+# the file is anywhere near the size a healthy backup should be. Two
+# independent size floors close that gap: the backup must be within 50% of
+# (a) the source DB it was just copied from, and (b) the most recent prior
+# backup already on disk — (a) catches a literal mid-write/truncated copy,
+# (b) catches a copy of the wrong, much-smaller source entirely (the actual
+# 2026-08-24 failure mode, which (a) alone would NOT have caught: the tiny
+# worktree db was faithfully and completely copied, so backup_size ==
+# source_size for that run).
+# ---------------------------------------------------------------------------
+
+
+def test_backup_size_check_rejects_undersized_vs_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A backup dramatically smaller than the source DB it was just copied
+    from must be rejected — the literal mid-write/truncated-copy failure
+    mode named in the audit."""
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    _make_valid_db(db)
+    with open(db, "ab") as f:
+        f.write(b"\x00" * 2_000_000)
+
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    import sma.backup.runner as runner_mod
+
+    real_copy2 = runner_mod.shutil.copy2
+
+    def _truncated_copy2(src, dst, *a, **kw):
+        real_copy2(src, dst, *a, **kw)
+        with open(dst, "r+b") as f:
+            f.truncate(1000)
+
+    monkeypatch.setattr(runner_mod.shutil, "copy2", _truncated_copy2)
+
+    asof = date(2026, 4, 29)
+    notified: list[tuple[str, str]] = []
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(
+            db_path=db, backup_dir=backup_dir, asof=asof,
+            notify_fn=lambda title, message: notified.append((title, message)),
+        )
+
+    assert payload["quality"]["passed"] is False
+    assert "backup_size_implausible" in payload["quality"]["blocking_failures"]
+    assert any("size" in t.lower() for t, _m in notified)
+
+
+def test_backup_size_check_rejects_undersized_vs_prior_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A backup dramatically smaller than yesterday's backup must be rejected
+    even when it perfectly matches its own (wrong/tiny) source — the actual
+    2026-08-24 failure mode."""
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_valid_db(db)
+
+    prior_date = date(2026, 4, 28)
+    (backup_dir / f"sma-{prior_date.isoformat()}.duckdb").write_bytes(b"\x00" * 5_000_000)
+
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    asof = date(2026, 4, 29)
+    notified: list[tuple[str, str]] = []
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(
+            db_path=db, backup_dir=backup_dir, asof=asof,
+            notify_fn=lambda title, message: notified.append((title, message)),
+        )
+
+    assert payload["verified"] is True  # schema-only check alone still passes
+    assert payload["quality"]["passed"] is False
+    assert "backup_size_implausible" in payload["quality"]["blocking_failures"]
+    assert any("size" in t.lower() for t, _m in notified)
+
+
+def test_backup_size_check_blocks_offsite_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A size-implausible backup must never be trusted offsite — mirrors the
+    existing verification-failure guarantee (this is the exact gap that let
+    the 2026-08-24 stub reach the real iCloud folder)."""
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    offsite_dir = tmp_path / "offsite"
+    backup_dir.mkdir()
+    _make_valid_db(db)
+
+    prior_date = date(2026, 4, 28)
+    (backup_dir / f"sma-{prior_date.isoformat()}.duckdb").write_bytes(b"\x00" * 5_000_000)
+
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    asof = date(2026, 4, 29)
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(
+            db_path=db, backup_dir=backup_dir, offsite_dir=offsite_dir, asof=asof,
+        )
+
+    assert payload["offsite"]["attempted"] is False
+    assert payload["offsite"]["copied"] is False
+    assert not (offsite_dir / f"sma-{asof.isoformat()}.duckdb").exists()
+
+
+def test_backup_size_check_passes_with_consistent_prior_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Normal day-to-day size fluctuation must not false-positive."""
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_valid_db(db)
+    prior_size = db.stat().st_size
+    prior_date = date(2026, 4, 28)
+    (backup_dir / f"sma-{prior_date.isoformat()}.duckdb").write_bytes(b"\x00" * prior_size)
+
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    asof = date(2026, 4, 29)
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(db_path=db, backup_dir=backup_dir, asof=asof)
+
+    assert payload["quality"]["passed"] is True
+
+
+def test_backup_size_check_skips_when_no_prior_backup_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """First-ever backup (nothing on disk to compare against) must not be
+    penalized for having no history."""
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    _make_valid_db(db)
+
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    asof = date(2026, 4, 29)
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        payload = run_backup(db_path=db, backup_dir=backup_dir, asof=asof)
+
+    assert payload["quality"]["passed"] is True
+
+
+def test_offsite_pruning_keeps_exactly_seven(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    db = tmp_path / "sma.duckdb"
+    backup_dir = tmp_path / "backups"
+    offsite_dir = tmp_path / "offsite"
+    _make_valid_db(db)
+    offsite_dir.mkdir()
+
+    # 8 pre-existing offsite files, oldest to newest.
+    base = date(2026, 4, 1)
+    for i in range(8):
+        (offsite_dir / f"sma-{(base + timedelta(days=i)).isoformat()}.duckdb").write_bytes(b"old")
+
+    monkeypatch.setenv("SMA_SENTINEL_DIR", str(tmp_path / "sentinels"))
+    monkeypatch.setattr(_locks, "DEFAULT_LOCK_PATH", tmp_path / ".sma-writer.lock")
+
+    asof = date(2026, 4, 29)  # 9th file once copied offsite
+    with writer_lock(label="test", lock_path=tmp_path / ".sma-writer.lock"):
+        run_backup(db_path=db, backup_dir=backup_dir, offsite_dir=offsite_dir, asof=asof)
+
+    remaining = sorted(f.name for f in offsite_dir.glob("sma-*.duckdb"))
+    assert len(remaining) == 7, f"expected exactly 7 offsite files, got {remaining}"
+    # The 2 oldest pre-existing files were pruned; today's new copy survives.
+    assert f"sma-{asof.isoformat()}.duckdb" in remaining
+    assert "sma-2026-04-01.duckdb" not in remaining
+    assert "sma-2026-04-02.duckdb" not in remaining

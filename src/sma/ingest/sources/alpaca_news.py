@@ -82,8 +82,27 @@ class AlpacaNewsSource:
 
         for i in range(0, len(tickers), self.batch_size):
             batch = tickers[i:i + self.batch_size]
-            batch_set = set(batch)
-            symbols_csv = ",".join(batch)
+            # Alpaca uses dot share-class notation (BRK.B) where the rest of the
+            # system is yfinance-canonical (BRK-B). Translate on request and map
+            # responses back so DB tickers stay canonical — the same fix
+            # alpaca_prices needed. Without it BRK-B had ZERO news rows all time
+            # (news_per_ticker_minimum failed daily with missing_news=['BRK-B']):
+            # the request symbol was unrecognized AND the returned "BRK.B" could
+            # never match a batch set holding "BRK-B".
+            # The reverse map is ONE-TO-MANY on purpose: `BRK-B` and `BRK.B` both
+            # translate to `BRK.B`, so a 1:1 `{v: k}` dict would keep only the
+            # last and silently drop or misattribute the other ticker's news
+            # (Codex review 2026-07-29). A `BRK.B` zombie has been in the
+            # universe before, so this is a real regression risk.
+            from_alpaca: dict[str, list[str]] = {}
+            for t in batch:
+                from_alpaca.setdefault(t.replace("-", "."), []).append(t)
+            # Match against Alpaca's notation, then map back when emitting rows.
+            batch_set = set(from_alpaca)
+            # dict preserves first-appearance order, so the outgoing symbol list
+            # is deterministic (a set's iteration order is not) and de-duplicated
+            # when two aliases collapse to the same Alpaca symbol.
+            symbols_csv = ",".join(from_alpaca)
             page_token: str | None = None
 
             while True:
@@ -157,7 +176,12 @@ class AlpacaNewsSource:
                         else "alpaca"
                     )
                     body_excerpt = summary[:500] if summary else None
-                    matching = [s for s in art_symbols if s in batch_set]
+                    # art_symbols are in Alpaca's notation; store canonical.
+                    matching = [
+                        canonical
+                        for s in art_symbols if s in batch_set
+                        for canonical in from_alpaca[s]
+                    ]
                     for ticker in matching:
                         key = (ticker, h)
                         if key in seen:

@@ -16,6 +16,7 @@ from datetime import date
 
 import pandas as pd
 
+from sma.backtest.fees import FeeSchedule
 from sma.backtest.metrics import (
     annualized_return,
     calmar,
@@ -28,8 +29,16 @@ from sma.backtest.result import BacktestResult
 from sma.backtest.risk import RiskRails, check_order
 from sma.backtest.slippage import SlippageModel, apply_slippage
 from sma.backtest.strategies.base import Strategy, StrategyDecision
+from sma.live.sizing import SizingPolicy
 
 logger = logging.getLogger(__name__)
+
+#: Starting capital for a backtest when the caller does not say otherwise.
+#: Every research script and the evaluate CLI pin this same number so results
+#: stay comparable across studies; it matches the paper account's original
+#: $100k deposit. It is a PARAMETER everywhere — pass `initial_cash=` to run a
+#: study at $50, $10k or $10M (see tests/unit/backtest/test_capital_scale.py).
+DEFAULT_INITIAL_CASH: float = 100_000.0
 
 
 class LookaheadLeakError(Exception):
@@ -127,11 +136,14 @@ def simulate(
     window_name: str,
     start_date: date,
     end_date: date,
-    initial_cash: float = 100_000.0,
+    initial_cash: float = DEFAULT_INITIAL_CASH,
     slippage_model: SlippageModel | None = None,
+    fees: FeeSchedule | None = None,
+    sizing: SizingPolicy | None = None,
     rails: RiskRails | None = None,
     seed: int | None = None,
     membership: dict[str, date] | None = None,
+    extra_cash_floor_by_date: dict[date, float] | None = None,
 ) -> BacktestResult:
     """Walk forward through trading dates and simulate a strategy.
 
@@ -145,10 +157,25 @@ def simulate(
             any of those dates. Sells are unaffected. Pass None to disable.
         window_name: "train", "val", or "test"; recorded on the result.
         start_date / end_date: inclusive bounds for the simulation.
-        initial_cash: starting account value.
+        initial_cash: starting account value. Defaults to DEFAULT_INITIAL_CASH.
         slippage_model: defaults to SlippageModel().
+        sizing: capital-scale sizing policy. Defaults to SizingPolicy(), which is
+            whole shares — exactly what this simulator has always done. Pass
+            SizingPolicy(fractional_shares=True) to model a small account that
+            can hold a fraction of a share; without it a $50 backtest correctly
+            but uselessly reports that nothing was ever bought.
+        fees: regulatory sell-side fee schedule. Defaults to FeeSchedule(), which
+            is ALL ZERO — paper trading charges no regulatory fees, so a zero
+            schedule is what keeps the backtest comparable to the paper track
+            record. Pass real rates only when modelling a real-money account.
         rails: defaults to RiskRails().
         seed: optional seed recorded on the result for provenance.
+        extra_cash_floor_by_date: optional {date: floor} overlay — on a listed
+            date the effective cash floor is max(drawdown-derisk floor, this).
+            The dispersion de-risk research seam (2026-07-20): detectors are
+            precomputed OUTSIDE the sim (point-in-time, prices-only) and fed in
+            as a floor series, so the sim stays deterministic and the money
+            path untouched. None = inert.
 
     Returns:
         BacktestResult with metrics and daily/monthly returns.
@@ -157,6 +184,10 @@ def simulate(
         slippage_model = SlippageModel()
     if rails is None:
         rails = RiskRails()
+    if fees is None:
+        fees = FeeSchedule()
+    if sizing is None:
+        sizing = SizingPolicy()
 
     universe_set = set(universe)
 
@@ -171,6 +202,11 @@ def simulate(
     positions_shares: dict[str, float] = {}     # ticker -> shares
     cost_basis: dict[str, float] = {}            # avg buy price per ticker
     entry_dates: dict[str, date] = {}            # ticker -> date first opened
+    # Post-entry PEAK price (adjusted space) per open position, for the trailing
+    # stop. Seeded at the entry fill and raised by each subsequent adj_close;
+    # NEVER includes a day's own open/high before that day's exit check, so the
+    # trailing stop can't fire on lookahead (a fresh high never triggers itself).
+    peak_price: dict[str, float] = {}            # ticker -> running peak
     holding_days_per_trade: list[int] = []       # filled when a position closes
     realized_round_trips: list[float] = []       # P&L per round trip (for hit rate)
     trades: list[dict] = []                       # one entry per filled buy/sell
@@ -215,7 +251,25 @@ def simulate(
     _decide_accepts_holdings = "current_holdings" in _decide_params
 
     for i, d in enumerate(all_dates):
-        # ---- Step 0: stop-loss scan (before pending orders; simulates automatic trigger at open).
+        # Tickers force-exited by a Step-0 price exit TODAY. A still-standing
+        # target from yesterday's decision must NOT re-buy them at the SAME open
+        # (that would undo the exit as a no-op round-trip and make any
+        # take-profit/trailing backtest meaningless). They may be re-bought on a
+        # LATER day if the model still wants them. Stays empty when all exit
+        # knobs are 0, so default behavior is byte-identical to the baseline.
+        _exited_today: set[str] = set()
+        # ---- Step 0: PRICE-EXIT scan (before pending orders; simulates automatic
+        # triggers at the open). Three independent, default-OFF risk exits, each
+        # evaluated against today's OPEN in adjusted space:
+        #   * take-profit   — open >= entry * (1 + take_profit_pct)   (bank gains)
+        #   * trailing stop — open <= peak  * (1 - trailing_stop_pct) (lock in a
+        #                     winner that rolled over; peak is the post-entry high)
+        #   * fixed stop    — open <= entry * (1 - stop_loss_pct)     (legacy)
+        # ORDERING vs min_hold: a price exit is a RISK exit and fires even inside
+        # rails.min_hold_days (matching the pre-existing fixed stop, which never
+        # consulted min_hold). min_hold only protects rank-rotation force-sells
+        # (Step 1b), not hard risk exits. When all three knobs are 0 this whole
+        # block is a no-op — identical to the prior stop-only baseline.
         for tkr in list(positions_shares.keys()):
             row = prices[(prices["ticker"] == tkr) & (prices["date"] == d)]
             if row.empty:
@@ -224,36 +278,53 @@ def simulate(
             basis = cost_basis.get(tkr, today_open)
             if basis <= 0:
                 continue
+            peak = peak_price.get(tkr, basis)
             pct_loss = (basis - today_open) / basis
+            # Priority: take-profit (bank the win) > trailing stop > fixed stop.
+            # Each guarded by its own knob so a 0 default disables it.
+            exit_reason: str | None = None
+            if rails.take_profit_pct > 0 and today_open >= basis * (1 + rails.take_profit_pct):
+                exit_reason = "take_profit"
+            elif (
+                rails.trailing_stop_pct > 0
+                and peak > 0
+                and today_open <= peak * (1 - rails.trailing_stop_pct)
+            ):
+                exit_reason = "trailing_stop"
             # stop_loss_pct <= 0 DISABLES the stop. Without this guard,
             # `pct_loss >= 0.0` fired on every flat/down position at the open,
             # liquidating break-even holdings and confounding no-stop baselines.
-            if rails.stop_loss_pct > 0 and pct_loss >= rails.stop_loss_pct:
-                shares = positions_shares[tkr]
-                # A stop is a market SELL — apply slippage like any other fill,
-                # don't model it as frictionless (which overstated the stop's
-                # backtested value). It MUST execute, so fall back to the raw open
-                # if the slippage model rejects the order on size-vs-ADV.
-                adv = _compute_adv_dollars(prices, tkr, d)
-                try:
-                    exit_px = apply_slippage(today_open, "sell", adv, slippage_model)
-                except ValueError:
-                    exit_px = today_open
-                proceeds = shares * exit_px
-                cash += proceeds
-                realized = (exit_px - basis) * shares
-                realized_round_trips.append(realized)
-                trades.append({
-                    "date": d, "ticker": tkr, "action": "stop_loss",
-                    "shares": shares, "price": exit_px, "value": proceeds,
-                })
-                if tkr in entry_dates:
-                    holding_days_per_trade.append((d - entry_dates[tkr]).days)
-                    del entry_dates[tkr]
-                del positions_shares[tkr]
-                del cost_basis[tkr]
-                num_trades += 1
-                logger.debug("stop-loss triggered for %s on %s at %.2f", tkr, d, today_open)
+            elif rails.stop_loss_pct > 0 and pct_loss >= rails.stop_loss_pct:
+                exit_reason = "stop_loss"
+            if exit_reason is None:
+                continue
+            shares = positions_shares[tkr]
+            # A price exit is a market SELL — apply slippage like any other fill,
+            # don't model it as frictionless (which overstated the stop's
+            # backtested value). It MUST execute, so fall back to the raw open
+            # if the slippage model rejects the order on size-vs-ADV.
+            adv = _compute_adv_dollars(prices, tkr, d)
+            try:
+                exit_px = apply_slippage(today_open, "sell", adv, slippage_model)
+            except ValueError:
+                exit_px = today_open
+            proceeds = shares * exit_px - fees.sell_fees(shares=shares, price=exit_px)
+            cash += proceeds
+            realized = (exit_px - basis) * shares
+            realized_round_trips.append(realized)
+            trades.append({
+                "date": d, "ticker": tkr, "action": exit_reason,
+                "shares": shares, "price": exit_px, "value": proceeds,
+            })
+            if tkr in entry_dates:
+                holding_days_per_trade.append((d - entry_dates[tkr]).days)
+                del entry_dates[tkr]
+            del positions_shares[tkr]
+            del cost_basis[tkr]
+            peak_price.pop(tkr, None)
+            _exited_today.add(tkr)
+            num_trades += 1
+            logger.debug("%s triggered for %s on %s at %.2f", exit_reason, tkr, d, today_open)
 
         # ---- Step 1: execute any orders pending from prior day (fill at today's open).
         # Live-parity rotation freeing (Codex 2026-06-11): the live risk
@@ -329,6 +400,19 @@ def simulate(
 
             side = "buy" if order_dollars > 0 else "sell"
 
+            # A ticker force-exited by a Step-0 price exit earlier TODAY must not
+            # be re-bought at the same open by a still-standing target from
+            # yesterday — that would undo the exit as a no-op round-trip. It may
+            # be re-bought on a LATER day if the model still wants it. Same-day
+            # SELLs are unaffected (the price exit already flattened the position,
+            # so `held <= 0` short-circuits any sell below anyway).
+            if side == "buy" and tkr in _exited_today:
+                logger.debug(
+                    "skip same-day re-entry of %s on %s: price-exited earlier today",
+                    tkr, d,
+                )
+                continue
+
             # Risk checks (only meaningful on increases; sells reduce exposure).
             if side == "buy":
                 # Build current dollar positions and sector exposure as of pre-trade.
@@ -401,6 +485,11 @@ def simulate(
                     slope=rails.drawdown_derisk_slope,
                     cap=rails.drawdown_derisk_cap,
                 )
+                if extra_cash_floor_by_date:
+                    # Research overlay (dispersion de-risk): highest floor wins.
+                    _eff_floor = max(
+                        _eff_floor, extra_cash_floor_by_date.get(d, 0.0)
+                    )
                 min_cash_after = _eff_floor * account_value
                 # cash + incoming force-sell proceeds (live parity), not bare cash
                 available_cash = cash + projected_fs_proceeds
@@ -411,14 +500,20 @@ def simulate(
                     )
                     continue
                 order_dollars = min(order_dollars, max_spendable)
-                # Whole shares only. Cash from rounding stays in cash.
-                shares_to_buy = int(order_dollars // fill_px)
+                # Whole shares by default; cash from rounding stays in cash.
+                # Fractional mode truncates to the policy's precision instead,
+                # which is what makes a small-account backtest meaningful.
+                shares_to_buy = sizing.target_qty(1.0, order_dollars, fill_px)
                 if shares_to_buy <= 0:
+                    continue
+                if sizing.min_order_notional > 0 and (
+                    shares_to_buy * fill_px < sizing.min_order_notional
+                ):
                     continue
                 cost = shares_to_buy * fill_px
                 if cost > available_cash:
                     # Can't afford even with incoming force-sell proceeds. Trim.
-                    shares_to_buy = int(available_cash // fill_px)
+                    shares_to_buy = sizing.target_qty(1.0, available_cash, fill_px)
                     if shares_to_buy <= 0:
                         continue
                     cost = shares_to_buy * fill_px
@@ -427,7 +522,7 @@ def simulate(
                 # live where buys+sells submit together). available_cash is
                 # recomputed per buy from the updated cash, so the shared
                 # projected proceeds are consumed correctly without double-count.
-                cash -= cost
+                cash -= cost + fees.buy_fees(shares=shares_to_buy, price=fill_px)
                 prev_shares = positions_shares.get(tkr, 0.0)
                 prev_basis = cost_basis.get(tkr, 0.0)
                 new_shares = prev_shares + shares_to_buy
@@ -436,6 +531,10 @@ def simulate(
                 positions_shares[tkr] = new_shares
                 if tkr not in entry_dates:
                     entry_dates[tkr] = d
+                # Seed / raise the post-entry peak. A brand-new position starts
+                # at its fill; adding to an existing one keeps the higher peak so
+                # the trailing stop still references the true post-entry high.
+                peak_price[tkr] = max(peak_price.get(tkr, 0.0), fill_px)
                 trades.append({
                     "date": d, "ticker": tkr, "action": "buy",
                     "shares": shares_to_buy, "price": fill_px, "value": cost,
@@ -447,13 +546,22 @@ def simulate(
                     continue
                 # Sell shares to bring position to target_dollars.
                 shares_to_sell_value = -order_dollars  # positive
-                shares_to_sell = min(held, int(shares_to_sell_value // fill_px) + 1)
+                if sizing.fractional_shares:
+                    # No `+ 1`: that existed only to compensate for the floor
+                    # below, and a whole extra share is a large error once the
+                    # position itself can be a fraction of one.
+                    shares_to_sell = min(held, shares_to_sell_value / fill_px)
+                else:
+                    shares_to_sell = min(held, int(shares_to_sell_value // fill_px) + 1)
                 # Don't oversell.
                 if shares_to_sell > held:
                     shares_to_sell = held
                 if shares_to_sell <= 0:
                     continue
-                proceeds = shares_to_sell * fill_px
+                proceeds = (
+                    shares_to_sell * fill_px
+                    - fees.sell_fees(shares=shares_to_sell, price=fill_px)
+                )
                 cash += proceeds
                 # Round-trip P&L: realized = (fill_px - cost_basis) * shares_to_sell
                 basis = cost_basis.get(tkr, fill_px)
@@ -467,6 +575,7 @@ def simulate(
                         del entry_dates[tkr]
                     positions_shares.pop(tkr, None)
                     cost_basis.pop(tkr, None)
+                    peak_price.pop(tkr, None)
                 trades.append({
                     "date": d, "ticker": tkr, "action": "sell",
                     "shares": shares_to_sell, "price": fill_px, "value": proceeds,
@@ -501,7 +610,7 @@ def simulate(
                 fill_px = apply_slippage(open_px, "sell", adv, slippage_model)
             except ValueError:
                 continue
-            proceeds = held * fill_px
+            proceeds = held * fill_px - fees.sell_fees(shares=held, price=fill_px)
             cash += proceeds
             basis = cost_basis.get(tkr, fill_px)
             realized_round_trips.append((fill_px - basis) * held)
@@ -510,6 +619,7 @@ def simulate(
                 del entry_dates[tkr]
             positions_shares.pop(tkr, None)
             cost_basis.pop(tkr, None)
+            peak_price.pop(tkr, None)
             trades.append({
                 "date": d, "ticker": tkr, "action": "sell",
                 "shares": held, "price": fill_px, "value": proceeds,
@@ -549,6 +659,19 @@ def simulate(
                     and (membership[dec.ticker] is None or membership[dec.ticker] <= d)
                 ]
             pending_orders.extend(decisions)
+
+        # ---- Step 2b: raise each open position's post-entry peak with today's
+        # adj_close (the mark price). This is the ONLY place peaks grow from
+        # market data; by updating at the CLOSE it stays strictly historical for
+        # the next day's open-time trailing-stop check (no lookahead). A no-op
+        # when trailing_stop is off, but cheap enough to always maintain.
+        for tkr in positions_shares:
+            prow = prices[(prices["ticker"] == tkr) & (prices["date"] == d)]
+            if prow.empty:
+                continue
+            ac = float(prow.iloc[0]["adj_close"])
+            if ac > peak_price.get(tkr, 0.0):
+                peak_price[tkr] = ac
 
         # ---- Step 3: mark-to-market at end of day, compute daily return.
         eq = _equity_at_close(d)

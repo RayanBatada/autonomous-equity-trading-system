@@ -9,6 +9,7 @@ from datetime import date
 import finnhub
 from loguru import logger
 
+from sma.ingest.sources._finnhub_retry import redact_secrets
 from sma.ingest.sources.base import IngestResult
 from sma.ingest.store import Store
 
@@ -32,7 +33,7 @@ class FinnhubSentimentSource:
             try:
                 resp = self._client.news_sentiment(t) or {}
             except Exception as e:
-                logger.warning("finnhub_sentiment failed for {}: {}", t, e)
+                logger.warning("finnhub_sentiment failed for {}: {}", t, redact_secrets(e))
                 continue
             sent = resp.get("sentiment") or {}
             buzz = resp.get("buzz") or {}

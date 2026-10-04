@@ -26,6 +26,12 @@ jobs:
       - name: Lint with ruff
         run: uv run ruff check .
 
+      # Public copy only: no real database fixtures, captured account data,
+      # session notes, personal paths or keys (docs/PUBLISHING.md).
+      - name: Public tree check
+        if: github.repository == 'RayanBatada/autonomous-equity-trading-system'
+        run: uv run python scripts/check_public_tree.py .
+
       - name: Run tests
         env:
           # Tests never hit real APIs; placeholders satisfy pydantic-settings.
@@ -35,4 +41,22 @@ jobs:
           ALPACA_API_SECRET: test
           ALPACA_BASE_URL: https://paper-api.alpaca.markets
           EDGAR_USER_AGENT: "CI Test (ci@example.com)"
-        run: uv run pytest --tb=short
+        # ubuntu-latest is a 2-vCPU runner. Measured locally (2026-09-02):
+        # -n 2 cut full-suite wall-clock from ~551s to ~346s (~37%) even
+        # under contention from another concurrent process sharing the
+        # machine, clearing the ~20% bar for bothering with CI parallelism.
+        # `-n 2` (not `-n auto`) pins the worker count explicitly to what
+        # was actually measured, rather than trusting os.cpu_count() to
+        # read the runner's real allotment correctly inside a container.
+        #
+        # Two passes: `serial`-marked tests do real, substantial disk I/O
+        # whose byte-level assertions proved sensitive to concurrent
+        # resource contention (an xdist worker sharing the runner's 2 vCPUs
+        # with this test skewed DuckDB CHECKPOINT/COPY-FROM-DATABASE file
+        # sizes enough to flip a size-reclaimed assertion -- caught live in
+        # CI, not just local contention noise) -- they run alone, with no
+        # other worker active, right after the parallel pass for everything
+        # else.
+        run: |
+          uv run pytest -n 2 -m "not serial" --tb=short
+          uv run pytest -m serial --tb=short

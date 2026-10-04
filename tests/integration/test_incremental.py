@@ -77,7 +77,10 @@ def test_first_run_uses_long_lookback(tmp_path, monkeypatch):
     assert seen_lookback["v"] == 1095
 
 
-def test_subsequent_run_uses_one_day_lookback(tmp_path, monkeypatch):
+def test_subsequent_run_uses_45_day_lookback(tmp_path, monkeypatch):
+    """Incremental nights use 45d (NOT 1d): the adj-drift self-heal needs a
+    real overlap window — the 1d clamp silently defeated the source's split
+    re-sync design (KLAC 10x for 3 weeks; review 2026-07-01)."""
     _seed_env(monkeypatch)
     cfg = _config_yaml(tmp_path, lookback=1095)
     uni = _universe_yaml(tmp_path)
@@ -105,7 +108,7 @@ def test_subsequent_run_uses_one_day_lookback(tmp_path, monkeypatch):
             assert result.exit_code == 0, result.output
 
     assert seen_lookbacks[0] == 1095
-    assert seen_lookbacks[1] == 1
+    assert seen_lookbacks[1] == 45
 
 
 def test_explicit_lookback_overrides_auto_detect(tmp_path, monkeypatch):

@@ -43,6 +43,21 @@ def test_build_rails_can_disable_min_hold_via_config():
     assert rails.min_hold_days == 0
 
 
+def test_build_rails_threads_price_exit_knobs():
+    """The 2026-07-01 price exits must reach RiskRails (same regression class
+    as min_hold_days once did): a config value silently dropped = a rail off."""
+    settings = _settings_with_rails(trailing_stop_pct=0.15, take_profit_pct=0.30)
+    rails = _build_rails(settings)
+    assert rails.trailing_stop_pct == 0.15
+    assert rails.take_profit_pct == 0.30
+
+
+def test_build_rails_price_exits_default_off():
+    rails = _build_rails(_settings_with_rails())
+    assert rails.trailing_stop_pct == 0.0
+    assert rails.take_profit_pct == 0.0
+
+
 def test_build_rails_no_config_falls_back_to_safe_default():
     """When the settings has no .live attribute (legacy path), defaults
     apply. The legacy default uses stop_loss_pct=0; min_hold_days is the
@@ -76,6 +91,45 @@ def test_build_strategy_honors_live_strategy_config():
     assert s.k == 15
     assert s.hold_rank == 30
     assert s.sector_neutralize == 1.0
+
+
+def test_build_strategy_threads_min_score_conviction_floor():
+    """The entry conviction floor must reach the strategy from config; a dropped
+    value would silently buy the full top-K on weak days."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from sma.live.__main__ import _build_strategy
+
+    settings = SimpleNamespace(
+        live=SimpleNamespace(
+            strategy=SimpleNamespace(
+                k=15, hold_rank=30, sector_neutralize=1.0, min_score=0.01
+            )
+        )
+    )
+    with patch("sma.model.predictor.Predictor") as _p:
+        _p.return_value = MagicMock()
+        s = _build_strategy(
+            ["AAPL"], use_theses=False, db="x.duckdb", store=MagicMock(),
+            settings=settings,
+        )
+    assert s.min_score == 0.01
+
+
+def test_build_strategy_min_score_defaults_off():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from sma.live.__main__ import _build_strategy
+
+    with patch("sma.model.predictor.Predictor") as _p:
+        _p.return_value = MagicMock()
+        s = _build_strategy(
+            ["AAPL"], use_theses=False, db="x.duckdb", store=MagicMock(),
+            settings=SimpleNamespace(live=SimpleNamespace()),
+        )
+    assert s.min_score is None
 
 
 def test_build_strategy_defaults_without_config_block():

@@ -547,7 +547,19 @@ def _main() -> None:
         submitted_start = today - timedelta(days=args.lookback_days)
     submitted_end = date.fromisoformat(args.end) if args.end else None
 
-    with writer_lock(label="senate_ingest"):
+    # 2026-08-23: the Mac was off through Sunday morning; when it booted at
+    # 19:11 ET the watchdog/launchd caught up senate-ingest, house-ingest,
+    # and a stale backup within the same second — all racing the single
+    # writer lock. House won; senate exhausted the default 30s timeout and
+    # exited 1, skipping the week's Senate PTR ingest. The two jobs' nominal
+    # Sunday fire times are already staggered 60 minutes (see
+    # src/sma/schedule.py) specifically to avoid this — that staggering is
+    # irrelevant to a boot-catchup, which fires every overdue job at once
+    # regardless of nominal spacing. This job is not urgent (a weekly
+    # disclosure refresh, kickable up to 8h late — see schedule.py's
+    # late_kick_max_hours=8.0 for this label), so patience beats racing:
+    # mirrors src/sma/backup/runner.py's writer_lock(..., timeout_s=900.0).
+    with writer_lock(label="senate_ingest", timeout_s=900.0):
         store = Store(path=str(args.db)).connect()
         try:
             rid = store.allocate_run_id()
@@ -560,6 +572,24 @@ def _main() -> None:
             print(f"summary: {summary}")
         finally:
             store.conn.close()
+        # Sentinel INSIDE the writer lock (serialization contract, like every
+        # other scheduled job) and only after success — without it the watchdog
+        # could never see this Sunday job as done and re-kicked it at every
+        # checkpoint (review 2026-07-20 HIGH).
+        from datetime import UTC, datetime
+
+        from sma.sentinels import write_sentinel
+        write_sentinel(
+            label="com.sma.senate-ingest.weekly",
+            asof=date.today(),
+            payload={
+                "label": "com.sma.senate-ingest.weekly",
+                "asof": date.today().isoformat(),
+                "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "run_id": rid,
+                "summary": str(summary),
+            },
+        )
 
 
 if __name__ == "__main__":

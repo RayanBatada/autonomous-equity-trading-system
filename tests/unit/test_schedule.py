@@ -14,8 +14,8 @@ from sma.schedule import (
 )
 
 
-def test_schedule_has_all_twelve_jobs():
-    assert len(SCHEDULE) == 12
+def test_schedule_has_all_thirteen_jobs():
+    assert len(SCHEDULE) == 13
     labels = {j.label for j in SCHEDULE}
     assert labels == {
         "com.sma.ingest.daily",
@@ -30,7 +30,26 @@ def test_schedule_has_all_twelve_jobs():
         "com.sma.monitoring.daily",
         "com.sma.senate-ingest.weekly",
         "com.sma.house-ingest.weekly",
+        "com.sma.weekly-digest.weekly",
     }
+
+
+def test_weekly_digest_runs_sunday_1800():
+    """2026-08-29: week-in-review digest, after both Sunday disclosure
+    ingests (10:00/11:00) and well clear of the 22:00 backup. Never needs
+    the writer lock (DB-read-only)."""
+    j = get("com.sma.weekly-digest.weekly")
+    assert j.days == (Day.SUN,)
+    assert j.fire_time_et == time(18, 0)
+    assert j.requires_writer_lock is False
+    assert j.requires_market_data is False
+    assert j.depends_on == ()
+
+
+def test_weekly_digest_runs_today_on_sunday_only():
+    # 2026-08-30 is a Sunday
+    assert runs_today("com.sma.weekly-digest.weekly", asof=date(2026, 8, 30))
+    assert not runs_today("com.sma.weekly-digest.weekly", asof=date(2026, 8, 29))  # Saturday
 
 
 def test_autoresearch_runs_monday_0700_et():

@@ -25,10 +25,11 @@ import pandas as pd
 from sma.backtest.earnings_blackout import load_upcoming_earnings
 from sma.backtest.result import BacktestResult
 from sma.backtest.risk import RiskRails
-from sma.backtest.simulator import simulate
+from sma.backtest.simulator import DEFAULT_INITIAL_CASH, simulate
 from sma.backtest.slippage import SlippageModel
 from sma.backtest.strategies.base import Strategy
 from sma.backtest.windows import WindowName, window_dates
+from sma.db_connect import read_only_connect
 from sma.sectors import sector_map_for
 
 DEFAULT_DB_PATH = Path("data/sma.duckdb")
@@ -57,7 +58,9 @@ def _load_prices_for_window(
             raise FileNotFoundError(
                 f"No DuckDB at {db_path}; run `python -m sma.ingest run` first."
             )
-        owned_conn = duckdb.connect(str(db_path), read_only=True)
+        # read_only_connect (2026-08-05 audit): retry a transient lock overlap
+        # instead of crashing (this path is also used by predict backfills).
+        owned_conn = read_only_connect(db_path)
     else:
         owned_conn = None
         # Defensive: ensure caller-passed conn isn't None at this point.
@@ -101,7 +104,7 @@ def evaluate_strategy(
     window: WindowName,
     universe: list[str],
     seed: int | None = None,
-    initial_cash: float = 100_000.0,
+    initial_cash: float = DEFAULT_INITIAL_CASH,
     db_path: Path = DEFAULT_DB_PATH,
     slippage_model: SlippageModel | None = None,
     rails: RiskRails | None = None,

@@ -98,6 +98,13 @@ def writer_lock(
         raise ValueError(
             "writer_lock label must not contain newlines (PID file format requires single-line)"
         )
+    # NOTE: the def-time default is deliberate. Late-binding it to the
+    # (test-monkeypatched) module global makes every in-process CLI test
+    # deadlock against the conftest fixture that pre-holds that very lock for
+    # Store.connect's assertion (tried + reverted 2026-07-02). CLI tests
+    # therefore touch the CWD-relative real lock file — briefly and safely;
+    # the dangerous long-hold contention was the HEAVY lock, which late-binds
+    # and is isolated per-test in conftest.
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path = lock_path.with_suffix(".pid")

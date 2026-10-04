@@ -38,6 +38,68 @@ def test_load_settings_reads_yaml_and_env(tmp_path: Path, monkeypatch: pytest.Mo
     assert s.secrets.alpaca_base_url == "https://paper-api.alpaca.markets"
 
 
+def test_notify_trade_pushes_defaults_true_when_block_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """notify.trade_pushes is opt-out, not opt-in (task requirement): a
+    config.yaml with no `notify:` block at all -- e.g. every pre-2026-08-31
+    config on disk -- must still default to sending the nightly push."""
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({
+        "ingest": {
+            "default_lookback_days": 100,
+            "rate_limits": {
+                "finnhub": {"requests_per_minute": 55},
+                "newsapi": {"requests_per_day": 90},
+                "edgar": {"requests_per_second": 9},
+            },
+            "retries": {"max": 3, "base_delay": 1.0, "jitter": 0.5},
+            "circuit_breaker": {"failures_to_open": 5, "cooldown_minutes": 60},
+        },
+        "sources_enabled": ["yfinance"],
+    }))
+    monkeypatch.setenv("FINNHUB_API_KEY", "fake-fh")
+    monkeypatch.setenv("NEWSAPI_KEY", "fake-news")
+    monkeypatch.setenv("ALPACA_API_KEY", "fake-alp")
+    monkeypatch.setenv("ALPACA_API_SECRET", "fake-alp-sec")
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setenv("EDGAR_USER_AGENT", "Test User (t@example.com)")
+
+    s: Settings = load_settings(config_path=cfg_path)
+
+    assert s.notify.trade_pushes is True
+
+
+def test_notify_trade_pushes_can_be_disabled_via_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({
+        "ingest": {
+            "default_lookback_days": 100,
+            "rate_limits": {
+                "finnhub": {"requests_per_minute": 55},
+                "newsapi": {"requests_per_day": 90},
+                "edgar": {"requests_per_second": 9},
+            },
+            "retries": {"max": 3, "base_delay": 1.0, "jitter": 0.5},
+            "circuit_breaker": {"failures_to_open": 5, "cooldown_minutes": 60},
+        },
+        "sources_enabled": ["yfinance"],
+        "notify": {"trade_pushes": False},
+    }))
+    monkeypatch.setenv("FINNHUB_API_KEY", "fake-fh")
+    monkeypatch.setenv("NEWSAPI_KEY", "fake-news")
+    monkeypatch.setenv("ALPACA_API_KEY", "fake-alp")
+    monkeypatch.setenv("ALPACA_API_SECRET", "fake-alp-sec")
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setenv("EDGAR_USER_AGENT", "Test User (t@example.com)")
+
+    s: Settings = load_settings(config_path=cfg_path)
+
+    assert s.notify.trade_pushes is False
+
+
 def test_load_settings_raises_when_required_secret_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

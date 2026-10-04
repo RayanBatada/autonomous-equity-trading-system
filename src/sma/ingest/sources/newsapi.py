@@ -12,6 +12,7 @@ from datetime import UTC, date, datetime, timedelta
 import httpx
 from loguru import logger
 
+from sma.ingest.sources._finnhub_retry import redact_secrets
 from sma.ingest.sources.base import IngestResult
 from sma.ingest.store import Store
 
@@ -53,7 +54,8 @@ class NewsAPISource:
                     },
                 )
             except Exception as e:
-                logger.warning("newsapi request failed for {}: {}", t, e)
+                # apiKey is a query param, and httpx quotes the URL in its errors.
+                logger.warning("newsapi request failed for {}: {}", t, redact_secrets(e))
                 continue
 
             if resp.status_code == 429:

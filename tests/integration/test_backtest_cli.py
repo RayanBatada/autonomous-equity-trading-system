@@ -155,10 +155,29 @@ def test_evaluate_help_shows_use_theses_flag():
     assert "--use-theses" in result.output
 
 
-def test_build_strategy_xgb_top_k_use_theses_passes_store(monkeypatch: pytest.MonkeyPatch):
+def test_build_strategy_xgb_top_k_use_theses_passes_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
     """When --use-theses is set, _build_strategy should construct XGBoostTopKStrategy
     with use_theses=True and a non-None store. Otherwise both are off."""
+    import duckdb
+
+    import sma.backtest.__main__ as backtest_main
     from sma.backtest.__main__ import _build_strategy
+
+    # _build_strategy(use_theses=True) opens Store(path=_DEFAULT_DB_PATH,
+    # read_only=True) for real (not mocked -- only Predictor/XGBoostTopKStrategy
+    # are). _DEFAULT_DB_PATH is the CWD-relative "data/sma.duckdb", which this
+    # test previously left un-monkeypatched: it happened to pass locally (a
+    # real dev DB sits there) and in serial CI (some earlier-collected test
+    # apparently left a stray data/sma.duckdb on disk in that same process),
+    # but failed outright under pytest-xdist -n 2 in CI once collection order
+    # no longer guaranteed that -- "database does not exist". Point it at a
+    # real, isolated, per-test empty DuckDB file instead so this test never
+    # depends on ambient filesystem state.
+    db_path = tmp_path / "sma.duckdb"
+    duckdb.connect(str(db_path)).close()
+    monkeypatch.setattr(backtest_main, "_DEFAULT_DB_PATH", db_path)
 
     captured = {}
 

@@ -9,8 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
-
+from sma.db_connect import read_only_connect
 from sma.ingest.notify import send_telegram
 
 
@@ -21,7 +20,9 @@ def build_digest(
 ) -> str:
     """Compose the digest text. Every section is defensive: a missing table or
     column degrades to a note, never an exception — a digest must not crash."""
-    con = duckdb.connect(db_path, read_only=True)
+    # read_only_connect (2026-08-05 audit): digest runs right after decide, so
+    # it can land in the same window as a slow-running writer job.
+    con = read_only_connect(db_path)
     lines: list[str] = ["\U0001F4CA <b>SMA daily digest</b>"]
 
     try:

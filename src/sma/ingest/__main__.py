@@ -14,7 +14,8 @@ from sma.ingest.earnings_backfill import (
     backfill_earnings_yfinance,
 )
 from sma.ingest.notify import notify_failure
-from sma.ingest.ratelimit import TokenBucket
+from sma.ingest.quality import notify_degraded_quality_checks, notify_new_dead_or_frozen_tickers
+from sma.ingest.ratelimit import TokenBucket, per_minute_bucket
 from sma.ingest.runner import IngestRunner
 from sma.ingest.runner import run as ingest_run
 from sma.ingest.sources.alpaca_news import AlpacaNewsSource
@@ -47,6 +48,33 @@ def _ingest_quality_blocking(report) -> list[str]:
     return report.blocking_failures(waivers)
 
 
+def _resolve_ingest_deadline(asof: date_cls, *, no_deadline: bool):
+    """The `deadline` to pass into `ingest_run()` for `run`'s CLI call, or
+    None to run fully unbudgeted.
+
+    `--no-deadline` is an explicit, unconditional override (2026-09-17):
+    always run unbudgeted regardless of asof -- useful even on a genuine
+    same-day scheduled run, e.g. a manual intervention that must not lose
+    overlay sources to the clock.
+
+    Without the flag, this mirrors the pre-existing behavior: look up
+    asof's scheduled cutoff via sma.schedule.deadline, or None when asof
+    isn't a day the job runs at all (weekends/ValueError). Note this is
+    NOT what makes a historical --asof-date run unbudgeted -- that's
+    IngestRunner.run()'s own guard (asof_date == "today" in ET), which
+    applies regardless of what this function returns. This resolver only
+    covers the explicit CLI override.
+    """
+    if no_deadline:
+        return None
+    from sma import schedule as _sched
+
+    try:
+        return _sched.deadline("com.sma.ingest.daily", asof=asof)
+    except ValueError:
+        return None
+
+
 def _build_source(
     name: str,
     settings,
@@ -65,7 +93,11 @@ def _build_source(
             lookback_days=cfg.default_lookback_days,
         )
     if name == "finnhub_news":
-        kwargs = {"api_key": s.finnhub_api_key, "rate_limiter": finnhub_limiter}
+        kwargs = {
+            "api_key": s.finnhub_api_key,
+            "rate_limiter": finnhub_limiter,
+            "retry_sleep_budget_s": cfg.retry_sleep_budget_s,
+        }
         if lookback_days_override is not None:
             kwargs["lookback_days"] = lookback_days_override
         return FinnhubNewsSource(**kwargs)
@@ -80,7 +112,11 @@ def _build_source(
     if name == "finnhub_sentiment":
         return FinnhubSentimentSource(api_key=s.finnhub_api_key)
     if name == "finnhub_fundamentals":
-        return FinnhubFundamentalsSource(api_key=s.finnhub_api_key, rate_limiter=finnhub_limiter)
+        return FinnhubFundamentalsSource(
+            api_key=s.finnhub_api_key,
+            rate_limiter=finnhub_limiter,
+            retry_sleep_budget_s=cfg.retry_sleep_budget_s,
+        )
     if name == "newsapi":
         kwargs = {"api_key": s.newsapi_key}
         if lookback_days_override is not None:
@@ -215,11 +251,22 @@ def _catch_up_missing_prices(
     missing = _missing_price_dates(
         last_priced=last, asof=asof, sessions=sessions, max_back=max_back
     )
+    # Backfill PRICES ONLY, not the full overlay set. Re-running news/earnings/
+    # fundamentals/edgar for every missed day (each with its own 7-day lookback
+    # + 90s retry sleeps) multiplies rate-limited API calls and can blow the
+    # 20:30 ET deadline during a recovery; today's 45d/7d incremental lookbacks
+    # already re-cover the overlay windows. Price sources bypass the runner's
+    # deadline cutoff by design (prices or bust), so per-day price backfill is
+    # both fast and un-budgeted-safe. (review 2026-07-04)
+    from sma.ingest.quality import PRICE_SOURCES
+    price_objs = [s for s in source_objs if getattr(s, "name", None) in PRICE_SOURCES]
+    if not price_objs:
+        return 0
     done = 0
     for d in missing:
         try:
             logger.info("catch-up: backfilling missed ingest for {}", d)
-            ingest_run(asof=d, db_path=db, sources=source_objs, universe=universe_list)
+            ingest_run(asof=d, db_path=db, sources=price_objs, universe=universe_list)
             done += 1
         except Exception as e:
             logger.warning("catch-up: backfill for {} failed ({}); continuing", d, e)
@@ -271,7 +318,22 @@ def cli():
     default=False,
     help="Re-run even if today's ingest is already complete (default: skip duplicates)",
 )
-def run(config, universe, db, asof_date, sources, tickers, skip_quality, lookback_days, force):
+@click.option(
+    "--no-deadline",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disable the deadline budget entirely, even on a same-day scheduled "
+        "run: every requested source runs, none are skipped for time. A "
+        "historical --asof-date already runs unbudgeted without this flag "
+        "(IngestRunner exempts any asof that isn't today in ET) -- this is "
+        "for an explicit override on top of that, e.g. today's run."
+    ),
+)
+def run(
+    config, universe, db, asof_date, sources, tickers, skip_quality, lookback_days, force,
+    no_deadline,
+):
     settings = load_settings(config_path=Path(config))
     universe_list = load_universe(Path(universe))
     if tickers is not None:
@@ -325,8 +387,14 @@ def run(config, universe, db, asof_date, sources, tickers, skip_quality, lookbac
                 ro_store.close()
         except Exception:
             first_run = True
-        effective_lookback = settings.ingest.default_lookback_days if first_run else 1
-        mode_msg = "first-run (long lookback)" if first_run else "incremental (1d lookback)"
+        # Incremental nights use 45d, NOT 1d: the yfinance source's split/
+        # dividend back-adjustment self-heal needs a real overlap window to
+        # compare against stored rows (this 1d clamp silently defeated the
+        # source's documented 45d design — KLAC's 10:1 split sat 10x-desynced
+        # for three weeks, corrupting features AND training labels; review
+        # 2026-07-01). Same request count, just more upserted rows.
+        effective_lookback = settings.ingest.default_lookback_days if first_run else 45
+        mode_msg = "first-run (long lookback)" if first_run else "incremental (45d lookback)"
 
     adjusted_settings = deepcopy(settings)
     adjusted_settings.ingest.default_lookback_days = effective_lookback
@@ -334,10 +402,7 @@ def run(config, universe, db, asof_date, sources, tickers, skip_quality, lookbac
     # under the 60/min free-tier cap. Capacity sized to the configured
     # requests_per_minute, refill at the equivalent per-second rate.
     finnhub_rpm = settings.ingest.rate_limits.finnhub.requests_per_minute
-    finnhub_limiter = TokenBucket(
-        capacity=finnhub_rpm,
-        refill_rate_per_sec=finnhub_rpm / 60.0,
-    )
+    finnhub_limiter = per_minute_bucket(finnhub_rpm)
     source_objs = [_build_source(n, adjusted_settings, finnhub_limiter) for n in enabled]
     click.echo(f"Mode: {mode_msg}")
 
@@ -373,27 +438,49 @@ def run(config, universe, db, asof_date, sources, tickers, skip_quality, lookbac
         # checks, writes sentinel, and closes the store -- all inside the
         # writer_lock that we now hold.
         # Deadline budget: scheduled runs must not blow past the 20:30 ET
-        # deadline doing overlay work (6/10 ran 2h08m). Manual/backfill asofs
-        # that aren't scheduled days run unbudgeted.
+        # deadline doing overlay work (6/10 ran 2h08m). A historical
+        # --asof-date (or --no-deadline) runs unbudgeted -- see
+        # IngestRunner.run()'s own same-day guard and _resolve_ingest_deadline.
         from datetime import datetime as _dt
 
         from sma import schedule as _sched
-        try:
-            _deadline = _sched.deadline("com.sma.ingest.daily", asof=asof)
-        except ValueError:
-            _deadline = None
+        _deadline = _resolve_ingest_deadline(asof, no_deadline=no_deadline)
         result = ingest_run(
             asof=asof, db_path=db, sources=source_objs, universe=universe_list,
             deadline=_deadline,
             now_fn=lambda: _dt.now(tz=_sched.NY_TZ),
+            split_threshold=settings.ingest.split_inconsistency_threshold,
         )
 
     report = result.quality_report
     log_dir = Path("logs/quality")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{asof.isoformat()}.txt"
-    log_path.write_text(report.summary())
-    click.echo(report.summary())
+    # Pass the ingest job's waivers so the OVERALL line matches the sentinel and
+    # the exit code below, instead of printing FAIL on a run we treat as good.
+    _ingest_waivers = frozenset(_get_job("com.sma.ingest.daily").waivers)
+    log_path.write_text(report.summary(_ingest_waivers))
+    click.echo(report.summary(_ingest_waivers))
+
+    # no_dead_or_frozen_tickers is non-blocking (must never freeze the whole
+    # book over one dead name), so it doesn't participate in the blocking exit
+    # code below. It still needs to page someone: notify once per NEWLY
+    # flagged ticker, deduped via sma.ingest.dead_ticker_state, independent of
+    # whether this run also has a blocking failure.
+    newly_flagged = notify_new_dead_or_frozen_tickers(result.dead_frozen_flags, asof=asof)
+    if newly_flagged:
+        click.echo(f"no_dead_or_frozen_tickers: newly flagged {newly_flagged}")
+
+    # A check that PASSED only via a tolerance/fallback path (a few missing
+    # tickers under the 97% floor, or SPY's adj_close falling back to a prior
+    # session) doesn't block, but must not go completely unseen either — that
+    # silent gap is exactly what let the 2026-09-09 SPY fallback case (had it
+    # existed then) hide in logs/quality/*.txt with no page. Independent of
+    # whether this run also has a blocking failure.
+    degraded = notify_degraded_quality_checks(report, asof=asof)
+    if degraded:
+        click.echo(f"quality: degraded (non-blocking) {degraded}")
+
     # Exit non-zero only on BLOCKING failures (matching the sentinel + decide
     # gate). Non-blocking overlay failures (news/earnings/theses) are recorded in
     # the summary but must not mark the whole ingest job 'failed' to launchd.
@@ -467,10 +554,7 @@ def backfill_news(config, universe, db, start, end, batch_days, sources, tickers
         store = Store(path=db).connect()
         try:
             finnhub_rpm = settings.ingest.rate_limits.finnhub.requests_per_minute
-            finnhub_limiter = TokenBucket(
-                capacity=finnhub_rpm,
-                refill_rate_per_sec=finnhub_rpm / 60.0,
-            )
+            finnhub_limiter = per_minute_bucket(finnhub_rpm)
 
             # Build list of (chunk_start, chunk_end, lookback_days) tuples.
             # The first chunk's end is min(start + batch_days - 1, end); each
@@ -595,10 +679,7 @@ def backfill_earnings_cmd(quarters, provider, config, universe, db, tickers):
             yf_rows = 0
             if provider in ("finnhub", "both"):
                 finnhub_rpm = settings.ingest.rate_limits.finnhub.requests_per_minute
-                rate_limiter = TokenBucket(
-                    capacity=finnhub_rpm,
-                    refill_rate_per_sec=finnhub_rpm / 60.0,
-                )
+                rate_limiter = per_minute_bucket(finnhub_rpm)
                 finnhub_rows = backfill_earnings(
                     api_key=settings.secrets.finnhub_api_key,
                     tickers=universe_list,
@@ -631,6 +712,124 @@ def backfill_earnings_cmd(quarters, provider, config, universe, db, tickers):
             click.echo(f"backfill complete: {total_rows} rows across {len(universe_list)} tickers")
         finally:
             store.close()
+
+
+@cli.command("repair-splits")
+@click.option("--db", default="data/sma.duckdb", help="Path to DuckDB file")
+@click.option("--tickers", default=None, help="Comma-separated tickers to repair")
+@click.option(
+    "--all-flagged", is_flag=True, default=False,
+    help="Repair every ticker the split audit flags (yfinance vs alpaca, full history)",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Fetch and show before/after on an in-memory copy; write nothing",
+)
+@click.option(
+    "--keep-alpaca-adj", is_flag=True, default=False,
+    help="Do NOT null legacy alpaca adj_close (raw close) rows",
+)
+def repair_splits_cmd(db, tickers, all_flagged, dry_run, keep_alpaca_adj):
+    """Replace split-inconsistent yfinance history with a full refetch.
+
+    A job: takes the writer_lock, writes one ingest_log row
+    (source=yfinance_repair_splits) and a com.sma.ingest.repair_splits
+    sentinel. See sma.ingest.repair_splits for the adjustment semantics and why
+    alpaca rows stay raw.
+    """
+    from datetime import UTC, datetime
+
+    from sma.ingest.repair_splits import (
+        REPAIR_LOG_SOURCE,
+        SENTINEL_LABEL,
+        fetch_full_history,
+        flagged_tickers,
+        format_report,
+        null_legacy_alpaca_adj,
+        repair_ticker,
+    )
+    from sma.sentinels import write_sentinel
+
+    if bool(tickers) == bool(all_flagged):
+        raise click.UsageError("pass exactly one of --tickers or --all-flagged")
+    today = date_cls.today()
+
+    def _fetch(t):
+        # Through YESTERDAY only: a same-day bar fetched before the close is an
+        # intraday partial; tonight's ingest window writes today's real bar.
+        return fetch_full_history(t, end=today - timedelta(days=1))
+
+    def _resolve(store) -> list[str]:
+        if tickers:
+            return sorted({t.strip().upper() for t in tickers.split(",") if t.strip()})
+        return flagged_tickers(store.conn)
+
+    if dry_run:
+        store = Store(path=db).connect(read_only=True)
+        try:
+            wanted = _resolve(store)
+            click.echo(f"repair-splits DRY RUN: tickers={wanted}")
+            reps = [repair_ticker(store, t, run_id=0, dry_run=True, fetch_fn=_fetch)
+                    for t in wanted]
+            n_alp = 0 if keep_alpaca_adj else null_legacy_alpaca_adj(store, dry_run=True)
+        finally:
+            store.close()
+        for line in format_report(reps):
+            click.echo(line)
+        click.echo(f"alpaca rows whose legacy adj_close would be NULLed: {n_alp}")
+        return
+
+    with writer_lock(label="repair-splits"):
+        store = Store(path=db).connect()
+        run_id = None
+        try:
+            wanted = _resolve(store)
+            click.echo(f"repair-splits: tickers={wanted}")
+            run_id = store.allocate_run_id()
+            store.log_run_start(run_id, source=REPAIR_LOG_SOURCE)
+            try:
+                reps = [repair_ticker(store, t, run_id=run_id, dry_run=False, fetch_fn=_fetch)
+                        for t in wanted]
+                n_alp = 0 if keep_alpaca_adj else null_legacy_alpaca_adj(store, dry_run=False)
+            except Exception as e:
+                store.log_run_end(run_id, source=REPAIR_LOG_SOURCE, rows_inserted=0,
+                                  status="error", error=repr(e))
+                raise
+            rows = sum(r.rows_after for r in reps if r.status == "replaced")
+            failed = [r.ticker for r in reps if r.status != "replaced"]
+            store.log_run_end(
+                run_id, source=REPAIR_LOG_SOURCE, rows_inserted=rows,
+                status="ok" if not failed else "error",
+                error=(f"not repaired: {failed}" if failed else None),
+            )
+        finally:
+            store.close()
+        # Sentinel inside the writer_lock (ordering contract, sma.sentinels).
+        write_sentinel(
+            label=SENTINEL_LABEL,
+            asof=today,
+            payload={
+                "label": SENTINEL_LABEL,
+                "asof": today.isoformat(),
+                "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "run_id": run_id,
+                "tickers": {r.ticker: r.status for r in reps},
+                "rows_inserted": rows,
+                "alpaca_adj_close_nulled": n_alp,
+                "flags_after": {r.ticker: r.flags_after for r in reps},
+            },
+        )
+    for line in format_report(reps):
+        click.echo(line)
+    click.echo(f"alpaca rows with legacy adj_close NULLed: {n_alp}")
+    if failed:
+        raise SystemExit(2)
+
+
+# 1-minute IEX bars (sma.ingest.intraday); kept in its own module.
+from sma.ingest.intraday import intraday_cmd  # noqa: E402
+
+cli.add_command(intraday_cmd)
 
 
 if __name__ == "__main__":

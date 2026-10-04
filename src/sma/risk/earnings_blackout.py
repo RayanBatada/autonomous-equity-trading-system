@@ -24,8 +24,10 @@ def load_upcoming_earnings(
     """
     if not db_path.exists():
         return {}
-    import duckdb
-    con = duckdb.connect(str(db_path), read_only=True)
+    from sma.db_connect import read_only_connect
+
+    # 2026-08-05 audit: retry a transient lock overlap instead of crashing.
+    con = read_only_connect(db_path)
     try:
         df = con.execute("""
             SELECT ticker, report_date

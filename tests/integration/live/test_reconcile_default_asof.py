@@ -15,7 +15,7 @@ import uuid
 from datetime import date
 
 from sma.ingest.store import Store
-from sma.live.__main__ import _resolve_reconcile_asof
+from sma.live.__main__ import _resolve_reconcile_asofs
 
 
 def _make_store(tmp_path):
@@ -34,13 +34,36 @@ def _seed(store, *, asof: date, ticker: str, status: str = "submitted",
     """, [iid, asof, ticker, alpaca_order_id, status, rid])
 
 
+def _seed_stop_loss(store, *, asof: date, ticker: str, status: str = "submitted",
+                    alpaca_order_id: str | None = "ord-sl"):
+    rid = store.allocate_run_id()
+    iid = str(uuid.uuid4())
+    store.conn.execute("""
+        INSERT INTO intended_orders
+        (intended_order_id, asof_date, ticker, side, target_shares,
+         target_weight, last_price, source, alpaca_order_id, status, run_id)
+        VALUES (?, ?, ?, 'SELL', 10, NULL, 150.0, 'stop-loss', ?, ?, ?)
+    """, [iid, asof, ticker, alpaca_order_id, status, rid])
+
+
+def test_default_asof_discovers_stop_loss_only_batch(tmp_path):
+    """A day a stop fired but decide placed ZERO orders (all deltas 0) must still
+    be reconciled, or the stop SELL fill is orphaned forever and the ledger-drift
+    detector pages every reconcile (adversarial review 2026-07-04). The resolver
+    must discover source='stop-loss' batches, not just source='decide'."""
+    store = _make_store(tmp_path)
+    _seed_stop_loss(store, asof=date(2026, 5, 1), ticker="NVDA")
+    resolved = _resolve_reconcile_asofs(None, store)
+    assert date(2026, 5, 1) in resolved
+
+
 def test_explicit_asof_date_passes_through(monkeypatch, tmp_path):
     import sma.live.__main__ as _live_main
     monkeypatch.setattr(_live_main, "_today_et", lambda: date(2026, 5, 1))
     store = _make_store(tmp_path)
     _seed(store, asof=date(2026, 4, 27), ticker="AAPL")
-    resolved = _resolve_reconcile_asof("2026-05-01", store)
-    assert resolved == date(2026, 5, 1)
+    resolved = _resolve_reconcile_asofs("2026-05-01", store)
+    assert resolved == [date(2026, 5, 1)]
 
 
 def test_explicit_future_asof_is_rejected(monkeypatch, tmp_path):
@@ -53,7 +76,7 @@ def test_explicit_future_asof_is_rejected(monkeypatch, tmp_path):
     store = _make_store(tmp_path)
 
     try:
-        _resolve_reconcile_asof("2026-05-10", store)
+        _resolve_reconcile_asofs("2026-05-10", store)
     except click.ClickException as e:
         assert "future" in str(e).lower() or "today" in str(e).lower()
     else:
@@ -69,8 +92,8 @@ def test_default_asof_returns_none_when_no_intended_orders(monkeypatch, tmp_path
     fixed_today = date(2026, 5, 1)
     monkeypatch.setattr(_live_main, "_today_et", lambda: fixed_today)
     store = _make_store(tmp_path)
-    resolved = _resolve_reconcile_asof(None, store)
-    assert resolved is None
+    resolved = _resolve_reconcile_asofs(None, store)
+    assert resolved == []
 
 
 def test_default_asof_picks_max_submitted_intended_order_date(monkeypatch, tmp_path):
@@ -87,22 +110,25 @@ def test_default_asof_picks_max_submitted_intended_order_date(monkeypatch, tmp_p
     _seed(store, asof=date(2026, 4, 28), ticker="MSFT", alpaca_order_id="o2")
     _seed(store, asof=date(2026, 4, 30), ticker="GOOG", alpaca_order_id="o3")
 
-    resolved = _resolve_reconcile_asof(None, store)
-    assert resolved == date(2026, 4, 30)
+    resolved = _resolve_reconcile_asofs(None, store)
+    # 2026-07-01: ALL unreconciled batches, OLDEST first — the old newest-only
+    # pick permanently stranded deferred/outage batches behind newer ones.
+    assert resolved == [date(2026, 4, 27), date(2026, 4, 28), date(2026, 4, 30)]
 
 
-def test_default_asof_ignores_failed_submissions(tmp_path):
-    """A 'submission_failed' row from a later date should not fool the default
-    into picking that date — the order never reached Alpaca, there is nothing
-    to reconcile against it."""
+def test_default_asof_includes_failed_submission_batches(tmp_path):
+    """2026-07-01 (reversal of the old assumption): a 'submission_failed' row
+    CAN be live at the broker — a submit that times out on the response may
+    have been accepted (the coid backfill resolves it authoritatively). Such
+    batches must therefore be reconcile candidates, oldest first."""
     store = _make_store(tmp_path)
     _seed(store, asof=date(2026, 4, 28), ticker="AAPL",
           status="submitted", alpaca_order_id="o1")
     _seed(store, asof=date(2026, 4, 30), ticker="MSFT",
           status="submission_failed", alpaca_order_id=None)
 
-    resolved = _resolve_reconcile_asof(None, store)
-    assert resolved == date(2026, 4, 28)
+    resolved = _resolve_reconcile_asofs(None, store)
+    assert resolved == [date(2026, 4, 28), date(2026, 4, 30)]
 
 
 def test_default_asof_skips_already_reconciled_dates(monkeypatch, tmp_path):
@@ -127,9 +153,9 @@ def test_default_asof_skips_already_reconciled_dates(monkeypatch, tmp_path):
                  "completed_at": "2026-05-01T13:30:00Z"},
     )
 
-    resolved = _resolve_reconcile_asof(None, store)
-    assert resolved == date(2026, 4, 27), (
-        "should fall back to the next-newest unreconciled decide_date"
+    resolved = _resolve_reconcile_asofs(None, store)
+    assert resolved == [date(2026, 4, 27)], (
+        "sentineled dates are skipped; the unreconciled one is returned"
     )
 
 
@@ -162,5 +188,5 @@ def test_default_asof_returns_none_when_all_reconciled(monkeypatch, tmp_path):
                  "completed_at": "2026-05-01T13:30:00Z"},
     )
 
-    resolved = _resolve_reconcile_asof(None, store)
-    assert resolved is None
+    resolved = _resolve_reconcile_asofs(None, store)
+    assert resolved == []

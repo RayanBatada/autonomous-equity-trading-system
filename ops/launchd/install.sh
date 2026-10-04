@@ -42,6 +42,7 @@ JOBS=(
     "com.sma.monitoring.daily"
     "com.sma.senate-ingest.weekly"
     "com.sma.house-ingest.weekly"
+    "com.sma.weekly-digest.weekly"
     "com.sma.watchdog"
     "com.sma.dashboard"
 )

@@ -16,17 +16,29 @@ because neither source surfaces them in this code path. The Phase 3
 blackout rail only needs `report_date`, so this is sufficient.
 """
 
+import time
 from collections.abc import Callable
 from datetime import date
 from typing import Any
 
 import finnhub
 import pandas as pd
+import requests
 import yfinance as yf
 from loguru import logger
 
 from sma.ingest.ratelimit import TokenBucket
+from sma.ingest.sources._finnhub_earnings_symbols import earnings_vendor_aliases
+from sma.ingest.sources._finnhub_retry import fetch_with_retry
 from sma.ingest.store import Store
+
+# The finnhub SDK hardcodes a 10s DEFAULT_TIMEOUT (finnhub.client.Client).
+# The 2026-08-03 backfill hit repeated company_earnings read timeouts against
+# it (transient Finnhub slowness, not a rate limit) -- 30s gives real
+# responses room to land. Client.DEFAULT_TIMEOUT is a class attribute read as
+# `self.DEFAULT_TIMEOUT` in `_request`, so setting it on the instance shadows
+# the class default for this client only.
+CLIENT_TIMEOUT_S = 30
 
 
 def backfill_earnings(
@@ -37,6 +49,7 @@ def backfill_earnings(
     quarters: int = 8,
     rate_limiter: TokenBucket | None = None,
     client: Any | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> int:
     """Fetch the last `quarters` quarters of earnings for each ticker.
 
@@ -44,19 +57,48 @@ def backfill_earnings(
     """
     if client is None:
         client = finnhub.Client(api_key=api_key)
+        client.DEFAULT_TIMEOUT = CLIENT_TIMEOUT_S
 
     rows: list[tuple] = []
     for ticker in tickers:
         if rate_limiter is not None:
             rate_limiter.acquire()
-        try:
-            items = client.company_earnings(symbol=ticker, limit=quarters) or []
-        except Exception as e:
-            logger.warning("company_earnings failed for {}: {}", ticker, e)
+        # Finnhub uses dot share-class notation (BRK.B) where the universe is
+        # yfinance-canonical dash notation (BRK-B) -- same translation
+        # alpaca_prices/alpaca_news/finnhub_news already do. Query in vendor
+        # notation; storage below always uses the canonical `ticker`, not
+        # whatever symbol the response echoes back (see comment there).
+        vendor_symbol = earnings_vendor_aliases(ticker)[0]
+        # One retry on a read timeout only (transient Finnhub slowness, not a
+        # rate limit) -- mirrors the finnhub_news/finnhub_fundamentals 429
+        # retry-in-place pattern. Other exceptions (incl. a 429
+        # FinnhubAPIException, which the `--provider both` CLI path relies on
+        # falling straight through to the yfinance gap-fill) are not retried.
+        items = fetch_with_retry(
+            "company_earnings", ticker,
+            lambda vendor_symbol=vendor_symbol: client.company_earnings(
+                symbol=vendor_symbol, limit=quarters
+            ) or [],
+            is_retryable=lambda e: isinstance(e, requests.exceptions.ReadTimeout),
+            reason="read timeout",
+            rate_limiter=rate_limiter,
+            sleep_fn=sleep_fn,
+            max_retries=1,
+        )
+        if items is None:
             continue
 
         for item in items:
-            symbol = item.get("symbol") or ticker
+            # Regression (verified live 2026-08-16): Finnhub reports
+            # company-level earnings under ITS OWN symbol regardless of query
+            # spelling -- company_earnings("BRK-B") and company_earnings
+            # ("BRK.B") both return rows with symbol="BRK.A". Trusting
+            # `item.get("symbol")` stored 4 rows under ticker='BRK.A', a
+            # symbol outside the universe (canonical is BRK-B), so nothing
+            # downstream ever read them. This call is per-ticker, so there is
+            # no batch ambiguity about which canonical ticker an item
+            # belongs to -- always store the canonical `ticker` we requested.
+            symbol = ticker
             period_str = item.get("period")
             if not period_str:
                 logger.warning(

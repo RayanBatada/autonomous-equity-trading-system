@@ -136,6 +136,49 @@ def test_decide_writes_intended_orders_and_submits(db_with_prices):
     assert aapl_row[5] is not None   # alpaca_order_id populated
 
 
+def test_decide_result_carries_trade_push_message(db_with_prices):
+    """2026-08-31 (Rayan's ask): decide_once builds the nightly trade-push
+    message itself (it has the authoritative Order.full_exit flag and the
+    post-rails decisions) and hands it back on DecideResult; __main__.py
+    just sends it. A force-sold MRNA position (held, dropped by the model)
+    must render as a full exit with the PRIOR weight it held; a fresh AAPL
+    buy must render its post-rails TARGET weight."""
+    store, db = db_with_prices
+    for offset in range(5):
+        d = date(2026, 4, 27) + timedelta(days=offset)
+        store.conn.execute(
+            "INSERT INTO prices (ticker, date, open, high, low, close, "
+            " adj_close, volume, source, run_id) "
+            "VALUES ('MRNA', ?, 142.0, 142.0, 142.0, 142.0, 142.0, 1000000, "
+            "'yfinance', 1)",
+            [d],
+        )
+    alpaca, tc = _alpaca_mock(
+        equity=100_000.0, positions=[("MRNA", 100, 140.0)],
+    )
+    decisions = [
+        StrategyDecision(asof_date=date(2026, 5, 1), ticker="AAPL", target_weight=0.05),
+    ]
+    strategy = FakeStrategy(decisions)
+
+    result = decide_once(
+        asof=date(2026, 5, 1),
+        store=store, alpaca=alpaca,
+        universe=["AAPL", "MSFT", "MRNA"],
+        strategy=strategy,
+        sector_for=lambda t: "Tech",
+        rails=RiskRails(stop_loss_pct=0.0, min_hold_days=0),
+    )
+
+    assert result.submitted == 2  # SELL MRNA (force-sold) + BUY AAPL
+    assert result.trade_push_title == "SMA trades - Fri 5/1"
+    lines = result.trade_push_message.split("\n")
+    assert lines[0] == "2026-05-01"
+    assert "SELL MRNA — all (was 14.2% of book)" in lines
+    assert "BUY AAPL — 5.0% of equity" in lines
+    assert lines[-1] == "Equity $100,000 | 1 position"
+
+
 def test_decide_dry_run_writes_nothing(db_with_prices, capsys):
     store, db = db_with_prices
     alpaca, tc = _alpaca_mock()
@@ -235,6 +278,53 @@ def test_decide_raises_paranoia_rail_on_empty_decisions_with_held_positions(db_w
             sector_for=lambda t: "Tech",
             rails=RiskRails(stop_loss_pct=0.0),
         )
+
+
+def test_decide_ignores_garbage_high_snapshot_when_computing_drawdown_peak(db_with_prices):
+    """2026-07-30: a spuriously HIGH account_snapshots row (broker garbage,
+    e.g. the 2026-07-07 Alpaca wipe class of incident) must not set the
+    running equity peak. MAX(equity) never forgets, so an unfiltered garbage
+    peak would overstate drawdown FOREVER and wedge the drawdown-scaled
+    de-risk rail into blocking all buys. Seed a garbage $500k row alongside
+    normal ~$100k history; with the peak correctly reading ~$101k (not
+    $500k), a 10% buy at today's real $100k equity has near-zero drawdown
+    and must go through."""
+    store, db = db_with_prices
+    for d, eq in [
+        (date(2026, 4, 28), 100_000.0),
+        (date(2026, 4, 29), 500_000.0),  # garbage
+        (date(2026, 4, 30), 101_000.0),
+    ]:
+        store.conn.execute(
+            "INSERT INTO account_snapshots "
+            "(asof_date, equity, cash, buying_power, long_market_value, "
+            " position_count, total_unrealized_pnl, run_id) "
+            "VALUES (?, ?, 0, 0, ?, 0, 0, 1)",
+            [d, eq, eq],
+        )
+    alpaca, tc = _alpaca_mock(equity=100_000.0)
+    decisions = [
+        StrategyDecision(asof_date=date(2026, 5, 1), ticker="AAPL", target_weight=0.10),
+    ]
+    strategy = FakeStrategy(decisions)
+    rails = RiskRails(
+        stop_loss_pct=0.0, cash_floor_pct=0.05, max_position_pct=0.10,
+        drawdown_derisk_start=0.01, drawdown_derisk_slope=3.0,
+    )
+
+    result = decide_once(
+        asof=date(2026, 5, 1),
+        store=store, alpaca=alpaca,
+        universe=["AAPL", "MSFT"],
+        strategy=strategy,
+        sector_for=lambda t: "Tech",
+        rails=rails,
+    )
+
+    assert result.submitted == 1, (
+        "garbage-high snapshot must not inflate the peak and wedge the "
+        "derisk cash floor into blocking the buy"
+    )
 
 
 def test_decide_retry_after_failed_submit_replaces_failed_row(db_with_prices):
@@ -408,3 +498,49 @@ def test_sector_exposure_aggregates_by_sector():
     # JPM:  20*150=3000 → Financials = 0.03
     assert out["Tech"] == 0.09
     assert out["Financials"] == 0.03
+
+
+# --- min_hold anchor + asof cutoff (live-attribution study, 2026-10-01) ---
+def _fill(store, ticker, side, shares, filled_at):
+    store.conn.execute(
+        "INSERT INTO paper_fills (alpaca_order_id, asof_date, ticker, side, "
+        "filled_shares, fill_price, status, submitted_at, filled_at, run_id) "
+        "VALUES (?, ?, ?, ?, ?, 200.0, 'filled', ?, ?, 1)",
+        [f"{ticker}-{side}-{filled_at.isoformat()}", filled_at.date(), ticker, side,
+         shares, filled_at, filled_at],
+    )
+
+
+def _dropped_aapl_orders(store):
+    """Run decide for 2026-05-01 holding 35 AAPL while the model wants only
+    MSFT, so AAPL hits translate()'s force-sell path. Returns AAPL's orders."""
+    alpaca, _tc = _alpaca_mock(positions=[("AAPL", 35, 200.0)])
+    result = decide_once(
+        asof=date(2026, 5, 1),
+        store=store, alpaca=alpaca,
+        universe=["AAPL", "MSFT"],
+        strategy=FakeStrategy([
+            StrategyDecision(asof_date=date(2026, 5, 1), ticker="MSFT", target_weight=0.05),
+        ]),
+        sector_for=lambda t: "Tech",
+        rails=RiskRails(stop_loss_pct=0.0, min_hold_days=7),
+        dry_run=True,
+    )
+    return [(o.side, o.shares) for o in result.orders if o.ticker == "AAPL"]
+
+
+def test_min_hold_still_protects_a_fresh_entry(db_with_prices):
+    store, _db = db_with_prices
+    _fill(store, "AAPL", "BUY", 35, datetime(2026, 4, 28, 9, 31))
+    assert _dropped_aapl_orders(store) == []
+
+
+def test_min_hold_ignores_fills_after_asof(db_with_prices):
+    """Replaying a past night: a later close + reopen must not leak in. On the
+    real 5/1 night AAPL was 3 days old and locked; without the asof cutoff the
+    future 5/6 reopen gives held_days < 0, which reads as expired."""
+    store, _db = db_with_prices
+    _fill(store, "AAPL", "BUY", 35, datetime(2026, 4, 28, 9, 31))
+    _fill(store, "AAPL", "SELL", 35, datetime(2026, 5, 4, 9, 31))
+    _fill(store, "AAPL", "BUY", 35, datetime(2026, 5, 6, 9, 31))
+    assert _dropped_aapl_orders(store) == []

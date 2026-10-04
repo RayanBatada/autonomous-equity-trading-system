@@ -216,3 +216,86 @@ def test_price_sources_ordered_first(tmp_path):
     runner.run(asof_date=date(2026, 6, 10), sleep_fn=lambda s: None)
     assert calls == ["alpaca", "edgar"], "price sources must run first"
     store.close()
+
+
+def test_historical_asof_ignores_stale_deadline_and_runs_overlays(tmp_path):
+    """2026-09-17 bug (found during the Sept 2026 outage repair): `deadline` is
+    an ABSOLUTE wall-clock cutoff computed from asof_date's OWN scheduled fire
+    time (sma.schedule.deadline), not a "budget remaining from now". For a
+    historical asof_date (a repair/backfill run against a past trading day),
+    that cutoff is always already in the past by the time anyone runs the
+    command -- comparing it against the real current time made
+    `python -m sma.ingest run --asof-date <past D> --sources edgar` (etc.)
+    skip EVERY overlay source unconditionally, exactly what
+    scripts/backfill_sept2026_outage_fundamentals.py (54e0a7c) had to route
+    around. The deadline budget must only apply to a SCHEDULED SAME-DAY run:
+    asof_date == now_fn()'s date. Mirrors sma.agents.__main__._deadline_reached
+    / sma.autoresearch.__main__._search_deadline_reached's established rule.
+    """
+    from datetime import datetime
+
+    price = _FlakySource("yfinance", bad_attempts=0)
+    overlay = _FlakySource("edgar", bad_attempts=0)
+    store = _store(tmp_path)
+    # `now` is 2026-09-17 (today); asof_date is a historical trading day
+    # whose own scheduled cutoff (2026-06-10 20:30) is naturally long past by
+    # 2026-09-17 -- exactly the shape a real repair/backfill run has.
+    clock = _SlowClock(datetime(2026, 9, 17, 12, 0))
+    runner = IngestRunner(store=store, sources=[price, overlay], universe=["AAPL"])
+    run_id = runner.run(
+        asof_date=date(2026, 6, 10),
+        deadline=datetime(2026, 6, 10, 20, 30),
+        deadline_margin_s=600,
+        now_fn=clock.now,
+        sleep_fn=lambda s: None,
+    )
+    assert price.calls == 1
+    assert overlay.calls == 1, "a historical asof must run overlays despite a stale deadline"
+    rows = dict((r[0], r[1]) for r in _final_log_rows(store, run_id))
+    assert rows["yfinance"] == "ok"
+    assert rows["edgar"] == "ok"
+    store.close()
+
+
+def test_future_asof_also_unbudgeted(tmp_path):
+    """Symmetric with the historical case: an asof_date that is not TODAY
+    (even a future one) is not a scheduled same-day run either, so it must
+    not be budgeted -- mirrors _search_deadline_reached's
+    test_not_reached_for_future_asof."""
+    from datetime import datetime
+
+    overlay = _FlakySource("edgar", bad_attempts=0)
+    store = _store(tmp_path)
+    clock = _SlowClock(datetime(2026, 6, 10, 12, 0))
+    runner = IngestRunner(store=store, sources=[overlay], universe=["AAPL"])
+    runner.run(
+        asof_date=date(2026, 6, 17),  # a week ahead of "now"
+        deadline=datetime(2026, 6, 17, 18, 40),  # already past relative to "now" is irrelevant
+        deadline_margin_s=600,
+        now_fn=clock.now,
+        sleep_fn=lambda s: None,
+    )
+    assert overlay.calls == 1
+
+
+def test_same_day_asof_still_enforces_the_deadline_budget(tmp_path):
+    """Regression guard for the fix above: a genuinely SAME-DAY scheduled run
+    (asof_date == now_fn()'s date) must keep skipping overlays past the
+    cutoff exactly as before -- the historical-asof exemption must not
+    accidentally swallow the real budget."""
+    from datetime import datetime
+
+    price = _FlakySource("yfinance", bad_attempts=0)
+    overlay = _FlakySource("edgar", bad_attempts=0)
+    store = _store(tmp_path)
+    clock = _SlowClock(datetime(2026, 6, 10, 20, 25))  # same day, past cutoff
+    runner = IngestRunner(store=store, sources=[price, overlay], universe=["AAPL"])
+    runner.run(
+        asof_date=date(2026, 6, 10),
+        deadline=datetime(2026, 6, 10, 20, 30),
+        deadline_margin_s=600,
+        now_fn=clock.now,
+        sleep_fn=lambda s: None,
+    )
+    assert price.calls == 1
+    assert overlay.calls == 0, "same-day scheduled run must still honor the budget"

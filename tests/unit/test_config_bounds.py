@@ -28,3 +28,13 @@ def test_live_drift_rejects_out_of_range_pct():
         LiveDrift(catastrophic_loss_abort_pct=3.0)
     with pytest.raises(ValidationError):
         LiveDrift(buy_miss_alert_threshold_pct=-0.2)
+    with pytest.raises(ValidationError):
+        LiveDrift(catastrophic_peak_drawdown_abort_pct=3.0)  # 300% — nonsense fraction
+
+
+def test_live_drift_peak_drawdown_abort_pct_defaults_to_quarter():
+    """2026-07-30 money-path review: peak-relative catastrophic abort default
+    is 25% (distinct from the day-over-day catastrophic_loss_abort_pct's
+    30%)."""
+    d = LiveDrift()
+    assert d.catastrophic_peak_drawdown_abort_pct == 0.25

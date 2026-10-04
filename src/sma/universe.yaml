@@ -81,7 +81,6 @@ universe:
     V: 2026-04-25
     MA: 2026-04-25
     SPGI: 2026-04-25
-    BRK.B: 2026-05-10   # Berkshire Hathaway (added 2026-05-10)
     # Healthcare
     UNH: 2026-04-25
     JNJ: 2026-04-25
@@ -212,7 +211,13 @@ universe:
     AFRM: 2026-05-24    # Affirm
     # Gaming / interactive entertainment
     DKNG: 2026-05-24    # DraftKings
-    EA: 2026-05-24      # Electronic Arts
+    # EA removed 2026-08-31: Electronic Arts went private in a $55B LBO (PIF/
+    # Silver Lake/Affinity); stock stopped trading and was delisted from
+    # Nasdaq 2026-08-04, holders cashed out at $210/share. Never held a
+    # position (checked intended_orders/paper_fills — zero rows ever). No
+    # price gap to backfill: EA matches AAPL's dedup day-count exactly (147/
+    # 147) through its real last trading day 2026-08-04; every date after
+    # that is correctly absent, not missing.
     TTWO: 2026-05-24    # Take-Two Interactive
     RBLX: 2026-05-24    # Roblox
     # Clean energy
@@ -299,14 +304,29 @@ universe:
     PSA: 2026-06-12          # Real Estate
     SPG: 2026-06-12          # Real Estate
     WELL: 2026-06-12          # Real Estate
-    AVB: 2026-06-12          # Real Estate
+    # AVB removed 2026-08-31: AvalonBay merged with Equity Residential
+    # (merger of equals, $69B combined EV) to form Vivmark Residential;
+    # NYSE halted AVB before the open 2026-08-17 and it was delisted, each
+    # AVB share converting to 2.793 EQR shares. That 2.793 ratio is also why
+    # yfinance's AVB close before the halt (source='yfinance' rows through
+    # 2026-08-24, still present in prices) reads ~35.8% of alpaca's raw
+    # close for the same dates — Yahoo back-adjusts historical closes by
+    # the merger exchange ratio the same way it does for a stock split
+    # (see yfinance_prices.py's CRWD-split comment); that is NOT corrupt
+    # data and should not be "fixed". Never held a position (checked
+    # intended_orders/paper_fills — zero rows ever). No price gap to
+    # backfill: AVB matches AAPL's dedup day-count exactly (155/155)
+    # through its real last trading day 2026-08-14; every date after that
+    # is correctly absent, not missing. Successor ticker VMRK intentionally
+    # not added here — that is a separate universe decision, not part of
+    # this cleanup.
     CI: 2026-06-12          # Health Care
     HUM: 2026-06-12          # Health Care
     MCK: 2026-06-12          # Health Care
     SYK: 2026-06-12          # Health Care
     BDX: 2026-06-12          # Health Care
     ZTS: 2026-06-12          # Health Care
-    BRK-B: 2026-06-12          # Financials
+    BRK-B: 2026-05-10          # Financials (Berkshire; yfinance-canonical dash form — the dot twin BRK.B was a zombie dup, removed 2026-07-01)
     AON: 2026-06-12          # Financials
     TFC: 2026-06-12          # Financials
     ALL: 2026-06-12          # Financials
